@@ -124,6 +124,18 @@ func handleEnqueue(args []string) {
 		Timeout:  time.Duration(*timeoutSec) * time.Second,
 	}
 
+	// Refuse before committing to a long run rather than dying part-way
+	// through it. A worktree is a full checkout, and an ENOSPC mid-gate does
+	// not surface as a disk error — the Go build cache starts evicting entries
+	// it is writing and the run fails with a toolchain error that points
+	// nowhere near the real cause.
+	if warning, err := core.CheckDiskSpace(worktreeBaseDir()); err != nil {
+		fmt.Fprintf(os.Stderr, "Refusing to enqueue: %s\n", err)
+		os.Exit(1)
+	} else if warning != "" {
+		fmt.Fprintf(os.Stderr, "⚠️  %s\n", warning)
+	}
+
 	c := client.New("")
 
 	// Try to get (or auto-start) the shared daemon so this job coordinates
@@ -411,6 +423,16 @@ func handleClean() {
 // daemonJobDir is where job records are mirrored. Alongside the socket and
 // logs, so `pushguard clean` and the existing ~/.pushguard layout stay one
 // place.
+// worktreeBaseDir is where worktrees are created, and so the filesystem whose
+// free space actually matters. Mirrors git.NewWorktreeManager's default.
+func worktreeBaseDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return os.TempDir()
+	}
+	return filepath.Join(home, ".cache", "pushguard", "worktrees")
+}
+
 func daemonJobDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
