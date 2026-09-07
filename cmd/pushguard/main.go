@@ -367,15 +367,44 @@ func shortRef(j *core.Job) string {
 // queued -- so a caller who enqueued, kept working, and then genuinely needed
 // the answer had to invent a polling loop. The MCP surface has had
 // pushguard_await from the start; this is the CLI half of it.
+// splitPositional lifts a LEADING operand out of the argument list, leaving the
+// rest for a flag parser.
+//
+// Only a leading one, deliberately. A bare word anywhere else is ambiguous: in
+// `--timeout 60` the 60 is a flag value, not an operand, and telling the two
+// apart needs the flag set's arity. Handling the leading case is enough,
+// because that is the only order Go's own parser cannot cope with — with flags
+// first it stops at the operand and does the right thing on its own.
+func splitPositional(args []string) (string, []string) {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		return args[0], args[1:]
+	}
+	return "", args
+}
+
 func handleAwait(args []string) {
+	// Split the job id out BEFORE parsing flags.
+	//
+	// Go's flag package stops at the first non-flag argument, so
+	// `await <job-id> --timeout 2400` parsed nothing and silently used the
+	// default — which is the order this command's own usage string documents,
+	// and it cost a 900-second wait that reported a timeout on a job that was
+	// merely queued behind others.
+	//
+	// Accepting either order is the fix; a positional-then-flag command line is
+	// what anyone would type.
+	jobID, flags := splitPositional(args)
 	fs := flag.NewFlagSet("await", flag.ExitOnError)
 	timeoutSec := fs.Int("timeout", 900, "Seconds to wait before giving up")
-	_ = fs.Parse(args)
-	if fs.NArg() == 0 {
+	_ = fs.Parse(flags)
+	if jobID == "" {
+		// Flags came first, so the parser reached the operand itself.
+		jobID = fs.Arg(0)
+	}
+	if jobID == "" {
 		fmt.Fprintln(os.Stderr, "Usage: pushguard await <job-id> [--timeout <seconds>]")
 		os.Exit(1)
 	}
-	jobID := fs.Arg(0)
 
 	c := client.New("")
 	if !c.IsDaemonRunning() {
