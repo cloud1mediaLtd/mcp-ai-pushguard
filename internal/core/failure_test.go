@@ -5,20 +5,19 @@ import (
 	"testing"
 )
 
-// Both fixtures are real output from this repository's own consumer
-// (c1m-server `make pre-push`), not invented. That matters: the value of the
-// extractor is entirely in whether it beats a blind tail on the logs people
-// actually get, and both of these were cases where the tail did not answer the
-// question.
+// Both fixtures are modeled on real output from a large Go monorepo's
+// `make pre-push`, not invented. That matters: the value of the extractor is
+// entirely in whether it beats a blind tail on the logs people actually get,
+// and both of these were cases where the tail did not answer the question.
 func TestExtractFailureFindsTheFailingTestUnderHundredsOfPassingLines(t *testing.T) {
 	var b strings.Builder
 	for i := 0; i < 300; i++ {
-		b.WriteString("ok  \tgithub.com/cloud1media/c1m-server/internal/workers/pkg\t1.4s\n")
+		b.WriteString("ok  \tgithub.com/example/backend/internal/workers/pkg\t1.4s\n")
 	}
 	b.WriteString("--- FAIL: TestInternalImportAliasesDoNotGrow (0.13s)\n")
 	b.WriteString("    package_naming_test.go:171: aliased internal imports fell to 1997, below budget 1998 — bank it.\n")
 	b.WriteString("FAIL\n")
-	b.WriteString("FAIL\tgithub.com/cloud1media/c1m-server/tests/architecture\t34.818s\n")
+	b.WriteString("FAIL\tgithub.com/example/backend/tests/architecture\t34.818s\n")
 	b.WriteString("make[1]: *** [test] Error 1\n")
 
 	got := ExtractFailure(b.String(), 20)
