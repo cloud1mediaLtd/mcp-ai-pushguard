@@ -83,3 +83,51 @@ func TestDaemonAndClientLifecycle(t *testing.T) {
 		t.Errorf("expected job to be removed after clean")
 	}
 }
+
+func TestEnsureDaemon_NoOpWhenAlreadyRunning(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "pushguard-ensure-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	socketPath := filepath.Join(tempDir, "test.sock")
+	memStore := store.NewMemoryStore(10)
+	engine := core.NewEngine(core.EngineConfig{MaxConcurrent: 1}, memStore, nil, nil, nil, nil)
+
+	server := daemon.NewServer(engine, daemon.Config{SocketPath: socketPath})
+	if err := server.Start(); err != nil {
+		t.Fatalf("failed to start daemon server: %v", err)
+	}
+	defer func() { _ = server.Stop(context.Background()) }()
+	time.Sleep(50 * time.Millisecond)
+
+	c := client.New(socketPath)
+	if err := c.EnsureDaemon(1); err != nil {
+		t.Fatalf("EnsureDaemon should no-op when daemon already running, got: %v", err)
+	}
+}
+
+func TestEnsureDaemon_RefusesToSpawnFromTestBinary(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "pushguard-ensure-nospawn-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// No daemon listening on this socket, and os.Args[0] is a `go test`
+	// binary (ends in ".test") — EnsureDaemon must refuse to spawn a
+	// background process from it rather than leaving a stray daemon behind
+	// on whatever machine runs this test suite.
+	c := client.New(filepath.Join(tempDir, "nonexistent.sock"))
+	start := time.Now()
+	err = c.EnsureDaemon(1)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected EnsureDaemon to refuse spawning from a test binary")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("expected an immediate refusal, not a poll/timeout loop; took %s", elapsed)
+	}
+}

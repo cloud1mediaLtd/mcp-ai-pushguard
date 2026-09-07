@@ -9,6 +9,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pushguard/pushguard/internal/core"
@@ -152,6 +157,69 @@ func (c *Client) GetLogs(id string, lines int) (string, error) {
 		return "", err
 	}
 	return result.Logs, nil
+}
+
+// EnsureDaemon returns immediately if the daemon is already reachable.
+// Otherwise it spawns `<this binary> daemon --concurrency N` as a detached
+// background process (its own session, so it survives the caller exiting),
+// logs to ~/.pushguard/daemon.log, and polls briefly for the socket to come
+// up. Every caller (MCP server, CLI, hook) can call this instead of requiring
+// a human to have run `pushguard daemon` or `make pushguard-start` by hand.
+func (c *Client) EnsureDaemon(concurrency int) error {
+	if c.IsDaemonRunning() {
+		return nil
+	}
+
+	// Never auto-spawn from a `go test` binary or when explicitly disabled —
+	// otherwise every machine that runs this package's tests without a
+	// daemon already up would spawn a stray background process from a
+	// throwaway test binary. Callers still fall back to an embedded engine.
+	if os.Getenv("PUSHGUARD_NO_AUTOSPAWN") != "" || strings.HasSuffix(filepath.Base(os.Args[0]), ".test") {
+		return fmt.Errorf("daemon auto-start disabled in this context")
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot locate pushguard binary to auto-start daemon: %w", err)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("cannot resolve home directory: %w", err)
+	}
+	logDir := filepath.Join(home, ".pushguard")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Errorf("failed to prepare daemon log dir: %w", err)
+	}
+	logFile, err := os.OpenFile(filepath.Join(logDir, "daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open daemon log: %w", err)
+	}
+	defer logFile.Close()
+
+	cmd := exec.Command(exePath, "daemon", "--concurrency", strconv.Itoa(concurrency))
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Stdin = nil
+	// Detach into its own session so it isn't killed when the spawning
+	// process (an MCP server tied to a Claude Code session, or a one-shot
+	// CLI invocation) exits.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start daemon: %w", err)
+	}
+	// Release our handle; the daemon manages its own lifetime from here.
+	_ = cmd.Process.Release()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.IsDaemonRunning() {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("daemon did not become ready within 5s (check ~/.pushguard/daemon.log)")
 }
 
 // Clean requests the daemon to purge completed jobs, stale worktrees, old logs, and run GC.

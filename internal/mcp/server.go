@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -45,33 +47,75 @@ type Server struct {
 	engine *core.Engine
 }
 
-// NewServer initializes an MCP server. It connects to the daemon if available,
-// otherwise spins up an embedded engine for standalone stdio usage.
+// NewServer initializes an MCP server. It first tries to auto-start the
+// shared daemon (so every caller ends up on one coordinated queue instead of
+// silently forking off isolated engines), and only falls back to an embedded
+// in-process engine if that spawn fails.
 func NewServer() *Server {
-	c := client.New("")
-	var eng *core.Engine
+	return newServerWithClient(client.New(""))
+}
 
-	if !c.IsDaemonRunning() {
-		// Boot up embedded engine
-		memStore := store.NewMemoryStore(100)
-		wm, _ := git.NewWorktreeManager("")
-		r, _ := runner.NewLocalRunner("")
-		n := notifier.NewMultiNotifier(notifier.NewMacOSNotifier(), &notifier.TerminalBellNotifier{})
+// newServerWithClient builds a Server around an already-constructed client,
+// letting tests point it at a throwaway daemon instead of the real
+// ~/.pushguard socket.
+func newServerWithClient(c *client.Client) *Server {
+	s := &Server{client: c}
 
-		cfg := core.EngineConfig{
-			MaxConcurrent:  1,
-			DefaultTimeout: 10 * time.Minute,
+	if err := c.EnsureDaemon(1); err != nil {
+		// Auto-start failed (binary not locatable, spawn error, etc.) — fall
+		// back to an embedded engine scoped to this process only. stdout is
+		// the JSON-RPC channel, so this diagnostic goes to stderr only.
+		fmt.Fprintf(os.Stderr, "pushguard: daemon auto-start failed, using embedded engine: %s\n", err)
+		s.ensureEmbeddedEngine()
+	}
+
+	return s
+}
+
+// redisAddrFromEnv mirrors the CLI's --redis-addr default so the embedded
+// fallback engine still publishes job events when Redis is reachable,
+// without needing its own flag parsing.
+func redisAddrFromEnv() string {
+	if v, ok := os.LookupEnv("PUSHGUARD_REDIS_ADDR"); ok {
+		return v
+	}
+	return "127.0.0.1:6379"
+}
+
+// ensureEmbeddedEngine lazily creates (once) and returns a per-process
+// fallback engine. Every tool handler routes to it whenever the daemon is
+// unreachable at call time — not just at server startup — because the
+// daemon can legitimately disappear mid-session (its idle-shutdown timer,
+// or someone killing it) after this server started with the daemon up and
+// s.engine still nil. Serve() processes one request at a time off a single
+// goroutine, so no locking is needed around this lazy init.
+func (s *Server) ensureEmbeddedEngine() *core.Engine {
+	if s.engine != nil {
+		return s.engine
+	}
+	memStore := store.NewMemoryStore(100)
+	wm, _ := git.NewWorktreeManager("")
+	r, _ := runner.NewLocalRunner("")
+	notifiers := []notifier.Notifier{notifier.NewMacOSNotifier(), &notifier.TerminalBellNotifier{}}
+	if addr := redisAddrFromEnv(); addr != "" {
+		if rn, err := notifier.NewRedisNotifier(addr, ""); err == nil {
+			notifiers = append(notifiers, rn)
 		}
-		eng = core.NewEngine(cfg, memStore, wm, r, n, func(dir string) []string {
-			return runner.DetectCommand(dir).Command
-		})
-		eng.Start()
+		// Unreachable Redis is not worth logging here: this is already the
+		// degraded fallback path (daemon unreachable), and stdout is the
+		// JSON-RPC channel.
 	}
+	n := notifier.NewMultiNotifier(notifiers...)
 
-	return &Server{
-		client: c,
-		engine: eng,
+	cfg := core.EngineConfig{
+		MaxConcurrent:  1,
+		DefaultTimeout: 10 * time.Minute,
 	}
+	s.engine = core.NewEngine(cfg, memStore, wm, r, n, func(dir string) []string {
+		return runner.DetectCommand(dir).Command
+	})
+	s.engine.Start()
+	return s.engine
 }
 
 // Serve reads JSON-RPC requests from in and writes to out.
@@ -140,7 +184,7 @@ func (s *Server) handleToolsList(out io.Writer, id any) {
 	tools := []map[string]any{
 		{
 			"name":        "pushguard_enqueue",
-			"description": "Enqueue a pre-push check or test suite in an isolated git worktree. Returns immediately with a job ID so your working tree is never locked and you can continue coding.",
+			"description": "Enqueue a pre-push check or test suite in an isolated git worktree. Returns immediately with a job ID so your working tree is never locked and you can continue coding. NOTHING will notify you when it finishes: this call has already returned, and the daemon runs the job out of band. So keep working, then either call pushguard_status when you reach a natural stopping point, or — if the outcome blocks your next step — call pushguard_await. Do not poll pushguard_status in a loop; that gives back everything the queue bought you.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -235,7 +279,7 @@ func (s *Server) handleToolsList(out io.Writer, id any) {
 			"name":        "pushguard_clean",
 			"description": "Performs queue maintenance: clears completed jobs from memory, prunes stale git worktrees, cleans up old test logs, and forces runtime garbage collection to free memory.",
 			"inputSchema": map[string]any{
-				"type": "object",
+				"type":       "object",
 				"properties": map[string]any{},
 			},
 		},
@@ -279,6 +323,13 @@ func (s *Server) toolEnqueue(out io.Writer, id any, args map[string]any) {
 	if repoPath == "" {
 		repoPath = "."
 	}
+	// Resolve against THIS process's working directory, not the daemon's. The
+	// daemon is separate and long-lived, so a relative path handed over as-is
+	// resolves wherever it was started -- reported to the caller as an invalid
+	// repository, which points at the wrong thing entirely.
+	if abs, err := filepath.Abs(repoPath); err == nil {
+		repoPath = abs
+	}
 	ref, _ := args["ref"].(string)
 	cmdStr, _ := args["command"].(string)
 	name, _ := args["name"].(string)
@@ -304,7 +355,7 @@ func (s *Server) toolEnqueue(out io.Writer, id any, args map[string]any) {
 	if s.client.IsDaemonRunning() {
 		job, pos, err = s.client.Enqueue(req)
 	} else {
-		job, pos, err = s.engine.Enqueue(req)
+		job, pos, err = s.ensureEmbeddedEngine().Enqueue(req)
 	}
 
 	if err != nil {
@@ -338,6 +389,13 @@ func (s *Server) toolStatus(out io.Writer, id any, args map[string]any) {
 	if n, ok := args["log_lines"].(float64); ok && n > 0 {
 		logLines = int(n)
 	}
+	// Read a wider window than we render. The failure is usually not in the
+	// tail -- a failed pre-push run ends with whichever package happened to
+	// finish last -- so the extractor needs more log than the caller wants back.
+	scanLines := logLines
+	if scanLines < 400 {
+		scanLines = 400
+	}
 
 	var job *core.Job
 	var logs string
@@ -346,12 +404,12 @@ func (s *Server) toolStatus(out io.Writer, id any, args map[string]any) {
 	if s.client.IsDaemonRunning() {
 		job, err = s.client.GetJob(jobID)
 		if err == nil {
-			logs, _ = s.client.GetLogs(jobID, logLines)
+			logs, _ = s.client.GetLogs(jobID, scanLines)
 		}
 	} else {
-		job, err = s.engine.GetJob(jobID)
+		job, err = s.ensureEmbeddedEngine().GetJob(jobID)
 		if err == nil {
-			logs = job.TailLogs(logLines)
+			logs = job.TailLogs(scanLines)
 		}
 	}
 
@@ -387,7 +445,12 @@ func (s *Server) toolStatus(out io.Writer, id any, args map[string]any) {
 		msg += fmt.Sprintf("- **Exit Code**: %d\n", job.ExitCode)
 	}
 	if logs != "" {
-		msg += fmt.Sprintf("\n**Recent Logs (last %d lines)**:\n```text\n%s\n```", logLines, logs)
+		// Answer "why did it fail" before "what did it print". Everything
+		// below this line is context; this line is the result.
+		if failure := core.ExtractFailure(logs, 30); failure != "" {
+			msg += fmt.Sprintf("\n**Why it failed**:\n```text\n%s\n```\n", failure)
+		}
+		msg += fmt.Sprintf("\n**Recent Logs (last %d lines)**:\n```text\n%s\n```", logLines, tailLines(logs, logLines))
 	}
 
 	s.sendToolText(out, id, msg, false)
@@ -405,7 +468,7 @@ func (s *Server) toolList(out io.Writer, id any, args map[string]any) {
 	if s.client.IsDaemonRunning() {
 		jobs, err = s.client.ListJobs(limit)
 	} else {
-		jobs = s.engine.ListJobs(limit)
+		jobs = s.ensureEmbeddedEngine().ListJobs(limit)
 	}
 
 	if err != nil {
@@ -442,7 +505,7 @@ func (s *Server) toolCancel(out io.Writer, id any, args map[string]any) {
 	if s.client.IsDaemonRunning() {
 		err = s.client.CancelJob(jobID)
 	} else {
-		err = s.engine.Cancel(jobID)
+		err = s.ensureEmbeddedEngine().Cancel(jobID)
 	}
 
 	if err != nil {
@@ -487,7 +550,7 @@ func (s *Server) toolAwait(out io.Writer, id any, args map[string]any) {
 			}
 		}
 	} else {
-		job, err = s.engine.AwaitJob(ctx, jobID, 1*time.Second)
+		job, err = s.ensureEmbeddedEngine().AwaitJob(ctx, jobID, 1*time.Second)
 	}
 
 	if err != nil {
@@ -506,8 +569,8 @@ func (s *Server) toolClean(out io.Writer, id any) {
 
 	if s.client.IsDaemonRunning() {
 		report, err = s.client.Clean()
-	} else if s.engine != nil {
-		r := s.engine.Clean()
+	} else {
+		r := s.ensureEmbeddedEngine().Clean()
 		report = &r
 	}
 
@@ -562,4 +625,13 @@ func (s *Server) sendError(out io.Writer, id any, code int, message string) {
 	}
 	data, _ := json.Marshal(resp)
 	_, _ = fmt.Fprintln(out, string(data))
+}
+
+// tailLines returns the last n lines of s.
+func tailLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
 }

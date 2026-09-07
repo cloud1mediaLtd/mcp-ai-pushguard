@@ -39,12 +39,26 @@ func (m *MultiNotifier) Notify(job *core.Job) error {
 	return nil
 }
 
-// MacOSNotifier uses osascript to trigger system notification banners and alert sounds on macOS.
-type MacOSNotifier struct{}
+// MacOSNotifier triggers system notification banners and alert sounds on
+// macOS. It prefers the `terminal-notifier` CLI (if installed) because plain
+// AppleScript's `display notification` has no click action at all — clicking
+// one just falls back to whatever macOS does with an unidentified sender
+// (commonly: reveal an unrelated, effectively empty folder). terminal-notifier
+// lets a click open the job's actual log file instead, and lets repeated
+// notifications from the same repo collapse into one stack (`-group`) instead
+// of piling up individually — both matter once this runs dozens of times a
+// day. Without it installed, PushGuard falls back to the old plain banner:
+// less useful on click, but no worse than before.
+type MacOSNotifier struct {
+	// terminalNotifierPath is resolved once at construction so every Notify
+	// call doesn't re-run a PATH lookup.
+	terminalNotifierPath string
+}
 
 // NewMacOSNotifier creates a macOS notification provider.
 func NewMacOSNotifier() *MacOSNotifier {
-	return &MacOSNotifier{}
+	path, _ := exec.LookPath("terminal-notifier")
+	return &MacOSNotifier{terminalNotifierPath: path}
 }
 
 // Notify displays a desktop banner on macOS.
@@ -71,7 +85,27 @@ func (m *MacOSNotifier) Notify(job *core.Job) error {
 		subtitle += " • Auto-pushed to remote"
 	}
 
-	// AppleScript: display notification "subtitle" with title "title" sound name "sound"
+	if m.terminalNotifierPath != "" {
+		args := []string{
+			"-title", title,
+			"-subtitle", subtitle,
+			"-message", strings.Join(job.Command, " "),
+			"-sound", sound,
+			// Same repo's notifications replace each other in Notification
+			// Center instead of stacking up one-by-one across dozens of runs.
+			"-group", "pushguard-" + job.RepoPath,
+		}
+		if job.LogFilePath != "" {
+			args = append(args, "-open", "file://"+job.LogFilePath)
+		}
+		cmd := exec.Command(m.terminalNotifierPath, args...)
+		return cmd.Run()
+	}
+
+	// Fallback: plain AppleScript banner. No click action is possible here —
+	// that's a limitation of `display notification` itself, not a bug in
+	// this code. Install terminal-notifier (`brew install terminal-notifier`)
+	// to get a banner whose click opens the actual job log.
 	script := fmt.Sprintf(
 		`display notification %q with title %q sound name %q`,
 		subtitle,

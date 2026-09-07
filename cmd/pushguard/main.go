@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -43,7 +44,7 @@ Commands:
 
 Examples:
   pushguard enqueue --repo .
-  pushguard enqueue --repo ./c1m-server --cmd "go test ./..." --auto-push
+  pushguard enqueue --repo ./backend --cmd "go test ./..." --auto-push
   pushguard status pg_a1b2c3d4
   pushguard clean
   pushguard mcp
@@ -67,6 +68,8 @@ func main() {
 		handleStatus(args)
 	case "list", "ls":
 		handleList(args)
+	case "await", "wait":
+		handleAwait(os.Args[2:])
 	case "cancel":
 		handleCancel(args)
 	case "clean":
@@ -103,8 +106,18 @@ func handleEnqueue(args []string) {
 		cmd = strings.Fields(*cmdStr)
 	}
 
+	// Resolve the repo path HERE, against the caller's working directory.
+	// The daemon is a separate long-lived process with its own cwd, so a
+	// relative path sent as-is is resolved against wherever the daemon happens
+	// to have been started -- which produced "invalid git repository at \".\""
+	// for a caller sitting in a perfectly good repository.
+	repoPath := *repo
+	if abs, err := filepath.Abs(repoPath); err == nil {
+		repoPath = abs
+	}
+
 	req := core.EnqueueRequest{
-		RepoPath: *repo,
+		RepoPath: repoPath,
 		Ref:      *ref,
 		Command:  cmd,
 		AutoPush: *autoPush,
@@ -112,6 +125,12 @@ func handleEnqueue(args []string) {
 	}
 
 	c := client.New("")
+
+	// Try to get (or auto-start) the shared daemon so this job coordinates
+	// with everything else on the machine instead of running in isolation.
+	if err := c.EnsureDaemon(1); err != nil {
+		fmt.Fprintf(os.Stderr, "ℹ️  Could not start shared daemon (%s); running standalone.\n", err)
+	}
 
 	// If daemon is running, use client
 	if c.IsDaemonRunning() {
@@ -126,6 +145,11 @@ func handleEnqueue(args []string) {
 		fmt.Printf("   Ref:       %s\n", job.Ref)
 		fmt.Printf("   Position:  #%d in queue\n", pos)
 		fmt.Printf("   Worktree:  Clean & unlocked (you can keep coding)\n")
+		// Nothing here notifies a caller that walked away: the desktop
+		// notification reaches a human, and this command has already exited as
+		// far as any process watching it is concerned. Name the follow-up, so
+		// "enqueue and carry on" does not quietly become "enqueue and forget".
+		fmt.Printf("   Notify:    pushguard await %s --timeout 1500   (run it in the background)\n", job.ID)
 
 		if *wait {
 			fmt.Printf("Waiting for job to finish...\n")
@@ -230,11 +254,28 @@ func handleStatus(args []string) {
 		fmt.Printf("Error:    %s\n", job.Error)
 	}
 
-	logs, err := c.GetLogs(jobID, 40)
-	if err == nil && logs != "" {
-		fmt.Println("\n--- Logs (last 40 lines) ---")
-		fmt.Println(logs)
+	logs, err := c.GetLogs(jobID, 400)
+	if err != nil || logs == "" {
+		return
 	}
+	// Lead with why it failed. A failed pre-push run is several hundred lines
+	// of "ok" and a handful that matter, and the tail is whatever finished
+	// last -- which is rarely the thing that broke.
+	if failure := core.ExtractFailure(logs, 30); failure != "" {
+		fmt.Println("\n--- Why it failed ---")
+		fmt.Println(failure)
+	}
+	fmt.Println("\n--- Logs (last 40 lines) ---")
+	fmt.Println(tailLines(logs, 40))
+}
+
+// tailLines returns the last n lines of s.
+func tailLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
 func handleList(args []string) {
@@ -265,6 +306,56 @@ func handleList(args []string) {
 			j.DurationString(),
 			truncate(strings.Join(j.Command, " "), 25),
 		)
+	}
+}
+
+// handleAwait blocks until a job finishes. `enqueue --wait` already covers
+// "start it and wait", but there was no way to wait on a job that is ALREADY
+// queued -- so a caller who enqueued, kept working, and then genuinely needed
+// the answer had to invent a polling loop. The MCP surface has had
+// pushguard_await from the start; this is the CLI half of it.
+func handleAwait(args []string) {
+	fs := flag.NewFlagSet("await", flag.ExitOnError)
+	timeoutSec := fs.Int("timeout", 900, "Seconds to wait before giving up")
+	_ = fs.Parse(args)
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: pushguard await <job-id> [--timeout <seconds>]")
+		os.Exit(1)
+	}
+	jobID := fs.Arg(0)
+
+	c := client.New("")
+	if !c.IsDaemonRunning() {
+		fmt.Fprintln(os.Stderr, "PushGuard daemon is not running.")
+		os.Exit(1)
+	}
+
+	deadline := time.Now().Add(time.Duration(*timeoutSec) * time.Second)
+	for {
+		job, err := c.GetJob(jobID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+			os.Exit(1)
+		}
+		if job.IsFinished() {
+			fmt.Printf("%s (exit %d) in %s\n", strings.ToUpper(string(job.Status)), job.ExitCode, job.DurationString())
+			if logs, err := c.GetLogs(jobID, 400); err == nil {
+				if failure := core.ExtractFailure(logs, 30); failure != "" {
+					fmt.Println("\n--- Why it failed ---")
+					fmt.Println(failure)
+				}
+			}
+			// Exit non-zero on a red job so a shell caller can branch on it.
+			if job.Status != core.StatusPassed {
+				os.Exit(1)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			fmt.Fprintf(os.Stderr, "Timed out after %ds; job %s is still %s.\n", *timeoutSec, jobID, job.Status)
+			os.Exit(2)
+		}
+		time.Sleep(5 * time.Second)
 	}
 }
 
@@ -317,21 +408,89 @@ func handleClean() {
 	fmt.Printf("   Heap Memory:       %.2f MB\n", float64(report.AllocBytesAfter)/(1024*1024))
 }
 
+// daemonJobDir is where job records are mirrored. Alongside the socket and
+// logs, so `pushguard clean` and the existing ~/.pushguard layout stay one
+// place.
+func daemonJobDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".pushguard", "jobs")
+}
+
+// defaultRedisAddr lets PUSHGUARD_REDIS_ADDR override the standard local
+// Redis address without requiring the --redis-addr flag on every invocation
+// (matches how DOPPLER_TOKEN-style env overrides work elsewhere in this
+// workspace). Empty stays empty: an explicit "" disables Redis publishing.
+func defaultRedisAddr() string {
+	if v, ok := os.LookupEnv("PUSHGUARD_REDIS_ADDR"); ok {
+		return v
+	}
+	return "127.0.0.1:6379"
+}
+
 func handleDaemon(args []string) {
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
 	socketPath := fs.String("socket", daemon.DefaultSocketPath(), "Path to Unix socket")
 	httpAddr := fs.String("http", "", "Optional HTTP address to bind (e.g. 127.0.0.1:8942)")
 	concurrency := fs.Int("concurrency", 1, "Max concurrent test workers")
+	idleMinutes := fs.Int("idle-shutdown-minutes", 30, "Self-shutdown after this many idle minutes with no jobs (0 disables)")
+	redisAddr := fs.String("redis-addr", defaultRedisAddr(), "Redis address for job-event pub/sub (empty disables); overridable via PUSHGUARD_REDIS_ADDR")
 	_ = fs.Parse(args)
+	idleShutdown := time.Duration(*idleMinutes) * time.Minute
 
-	memStore := store.NewMemoryStore(200)
+	// Mirror jobs to disk. The daemon is long-lived and callers are encouraged
+	// to enqueue and walk away, so a restart that erased every queued and
+	// running job would be invisible to exactly the people relying on it.
+	jobStore := store.NewDurable(store.NewMemoryStore(200), daemonJobDir())
+	orphans := jobStore.RecoverOrphans()
+
+	memStore := jobStore
 	wm, err := git.NewWorktreeManager("")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize worktrees: %s\n", err)
 		os.Exit(1)
 	}
+
+	// An interrupted job also leaves its worktree behind, and the age-based
+	// sweep in Clean will not touch one for an hour. A checkout of any size is
+	// expensive to leave lying around -- a large monorepo's worktree can easily be several hundred MB, so a
+	// few interrupted runs fill a disk, and the resulting ENOSPC surfaces as
+	// unrelated build failures in whatever runs next.
+	//
+	// Nothing can be running at startup, so every recovered orphan's worktree
+	// is safe to remove now rather than in an hour. Removing it through the
+	// recorded RepoPath is what lets git drop its .git/worktrees metadata too;
+	// the generic sweep only has the directory, so it can only unlink the files.
+	for _, orphan := range orphans {
+		fmt.Printf("⚠️  %s (%s): %s\n", orphan.ID, orphan.RepoPath, orphan.Error)
+		// WorktreeDir is assigned to the in-memory job the instant the worktree
+		// is created, but the record on disk may predate that write -- a job
+		// killed in its first second has a persisted WorktreeDir of "". The
+		// path is derivable, because CreateWorktree always builds
+		// BaseDir/<job id>, so fall back to that rather than leaving the
+		// directory behind for the age-based sweep.
+		worktreeDir := orphan.WorktreeDir
+		if worktreeDir == "" {
+			worktreeDir = filepath.Join(wm.BaseDir, orphan.ID)
+		}
+		if orphan.RepoPath != "" {
+			_ = wm.RemoveWorktree(orphan.RepoPath, worktreeDir)
+		}
+	}
 	r, _ := runner.NewLocalRunner("")
-	n := notifier.NewMultiNotifier(notifier.NewMacOSNotifier(), &notifier.TerminalBellNotifier{})
+	notifiers := []notifier.Notifier{notifier.NewMacOSNotifier(), &notifier.TerminalBellNotifier{}}
+	if *redisAddr != "" {
+		if rn, err := notifier.NewRedisNotifier(*redisAddr, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "[pushguard] Redis event publishing disabled (%s unreachable: %s)\n", *redisAddr, err)
+		} else {
+			defer rn.Close()
+			notifiers = append(notifiers, rn)
+			fmt.Printf("   Redis events: publishing to %q on %s\n", notifier.DefaultRedisEventsChannel, *redisAddr)
+		}
+	}
+	n := notifier.NewMultiNotifier(notifiers...)
 
 	engine := core.NewEngine(
 		core.EngineConfig{
@@ -358,18 +517,141 @@ func handleDaemon(args []string) {
 	if *httpAddr != "" {
 		fmt.Printf("   HTTP API:    http://%s\n", *httpAddr)
 	}
+	if idleShutdown > 0 {
+		fmt.Printf("   Idle shutdown: after %s with no queued/running jobs\n", idleShutdown)
+	} else {
+		fmt.Printf("   Idle shutdown: disabled\n")
+	}
 
 	// Wait for terminate signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// Self-shutdown when idle: a daemon nobody is using should not sit
+	// around forever on a personal machine. It cleans up after itself
+	// (same sweep as `pushguard clean`) right before exiting, and the next
+	// enqueue call simply respawns it.
+	idleDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-idleDone:
+				return
+			case <-ticker.C:
+				if idleShutdown <= 0 {
+					continue
+				}
+				if engine.ActiveJobCount() == 0 && engine.IdleDuration() >= idleShutdown {
+					report := engine.Clean()
+					fmt.Printf("\n[pushguard] idle for %s with no jobs — cleaning up and shutting down "+
+						"(jobs flushed=%d, worktrees pruned=%d, logs pruned=%d)\n",
+						idleShutdown, report.JobsFlushed, report.WorktreesPruned, report.LogsPruned)
+					sigChan <- syscall.SIGTERM
+					return
+				}
+			}
+		}
+	}()
+
+	// Prune stale worktrees/logs on a fixed schedule, independent of the idle
+	// timer above. A daemon queued dozens of times a day may never go idle
+	// long enough to trigger idle-shutdown's full Clean(), which would
+	// otherwise leave old worktrees/logs piling up all day. This only
+	// touches disk state (not the in-memory job store), so it never makes a
+	// still-relevant job disappear from pushguard_list/status.
+	diskPruneDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-diskPruneDone:
+				return
+			case <-ticker.C:
+				worktreesPruned, logsPruned := engine.PruneDiskArtifacts()
+				if worktreesPruned > 0 || logsPruned > 0 {
+					fmt.Printf("[pushguard] scheduled disk prune: worktrees pruned=%d, logs pruned=%d\n",
+						worktreesPruned, logsPruned)
+				}
+			}
+		}
+	}()
+
 	<-sigChan
+	close(idleDone)
+	close(diskPruneDone)
 
 	fmt.Println("\nShutting down PushGuard daemon...")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	_ = server.Stop(ctx)
+
+	// Cancel in-flight work BEFORE stopping, or this never returns.
+	//
+	// Engine.Stop() is wg.Wait(): it waits for the worker loops, and a worker
+	// running an ~8 minute pre-push gate will hold it for the full ~8 minutes.
+	// So `pkill pushguard daemon` did not stop the daemon at all — it left it
+	// hanging until the job it was already running finished, which looks
+	// exactly like a daemon that ignored the signal.
+	//
+	// Cancelling first kills the job processes, the workers return, and Stop()
+	// completes promptly.
+	inFlight := []*core.Job{}
+	for _, job := range jobStore.List(0) {
+		if job != nil && !job.IsFinished() {
+			inFlight = append(inFlight, job)
+			_ = engine.Cancel(job.ID)
+		}
+	}
+	if len(inFlight) > 0 {
+		fmt.Printf("Cancelling %d in-flight job(s)...\n", len(inFlight))
+	}
+
+	// Only now is it safe to touch a worktree: deleting a directory out from
+	// under a running compiler produces a failure that looks like a code error
+	// and is not.
 	engine.Stop()
+
+	// Reclaim what the interrupted jobs were using.
+	//
+	// The idle-shutdown path already cleaned up on its way out; a signal did
+	// not, so `pkill pushguard daemon` left every worktree behind for the
+	// age-based sweep to find an hour later — and a large monorepo's worktree
+	// can easily be several hundred MB, so a few interrupted runs fill a
+	// disk. The resulting ENOSPC then surfaces as unrelated build failures in
+	// whatever runs next, which is a genuinely confusing thing to debug.
+	//
+	// This is the graceful half. It cannot be the whole answer: SIGKILL runs no
+	// code at all, so RecoverOrphans at startup stays as the backstop. Belt and
+	// braces on purpose — the two cover different failures.
+	reclaimed := 0
+	for _, job := range inFlight {
+		// Cancel already moved these to cancelled; restate WHY, because
+		// "cancelled" alone reads as somebody having cancelled it on purpose.
+		job.Error = "daemon shut down while this job was in flight; it did not run to completion — re-enqueue it"
+		if job.FinishedAt == nil {
+			finished := time.Now()
+			job.FinishedAt = &finished
+		}
+		job.Status = core.StatusCancelled
+		_ = jobStore.Update(job)
+
+		worktreeDir := job.WorktreeDir
+		if worktreeDir == "" {
+			worktreeDir = filepath.Join(wm.BaseDir, job.ID)
+		}
+		if job.RepoPath != "" {
+			_ = wm.RemoveWorktree(job.RepoPath, worktreeDir)
+			reclaimed++
+		}
+	}
+	if reclaimed > 0 {
+		fmt.Printf("Reclaimed %d worktree(s) from interrupted job(s); re-enqueue them.\n", reclaimed)
+	}
+
 	fmt.Println("Daemon stopped cleanly.")
 }
 

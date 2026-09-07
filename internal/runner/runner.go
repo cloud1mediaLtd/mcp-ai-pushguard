@@ -81,10 +81,21 @@ func (r *LocalRunner) Run(ctx context.Context, job *core.Job, workDir string) (i
 	go func() {
 		defer close(doneReader)
 		scanner := bufio.NewScanner(pr)
+		// Default 64KB max token size is too easy to exceed for build/test
+		// output (a long JSON line, a Go race-detector stack dump). Without
+		// raising this, Scan() silently stops on bufio.ErrTooLong and the
+		// rest of the run's output just never reaches the log — indistinguishable
+		// from the process going quiet. 1MB covers realistic worst cases here.
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			text := scanner.Text()
 			job.AppendLog(text)
 			_, _ = fmt.Fprintln(logFile, text)
+		}
+		if err := scanner.Err(); err != nil {
+			note := fmt.Sprintf("[pushguard] log capture stopped early: %s (output above may be incomplete)", err)
+			job.AppendLog(note)
+			_, _ = fmt.Fprintln(logFile, note)
 		}
 	}()
 

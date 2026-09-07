@@ -7,7 +7,8 @@ import (
 
 // Disk thresholds for the filesystem holding worktrees.
 //
-// A worktree is a full checkout: c1m-server's is ~900MB. Running out of space
+// A worktree is a full checkout: a large monorepo's can easily run several
+// hundred MB. Running out of space
 // part-way through a gate does not produce a clean error — the Go build cache
 // starts evicting entries it is mid-way through writing, and the run fails with
 // something like "could not import crypto/internal/fips140/subtle: could not

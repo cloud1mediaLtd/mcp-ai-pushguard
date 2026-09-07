@@ -3,6 +3,7 @@ package core
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -65,11 +66,19 @@ func GenerateJobID() string {
 
 // IsFinished returns true if the job has completed, failed, or was cancelled.
 func (j *Job) IsFinished() bool {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.isFinishedLocked()
+}
+
+func (j *Job) isFinishedLocked() bool {
 	return j.Status == StatusPassed || j.Status == StatusFailed || j.Status == StatusCancelled
 }
 
 // DurationString returns human-readable runtime of the job.
 func (j *Job) DurationString() string {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
 	if j.Duration > 0 {
 		return j.Duration.Round(time.Millisecond).String()
 	}
@@ -80,6 +89,83 @@ func (j *Job) DurationString() string {
 		return time.Since(*j.StartedAt).Round(time.Second).String()
 	}
 	return "0s"
+}
+
+// MarshalJSON takes a read lock before encoding so a job's fields can never
+// be read mid-write — the concrete bug this guards against: a worker
+// goroutine setting Status/ExitCode/etc. in executeJob while an HTTP handler
+// concurrently JSON-encodes the same *Job for a status/list response. The
+// jobAlias local type strips Job's methods (this one included) so
+// json.Marshal doesn't recurse into MarshalJSON forever.
+func (j *Job) MarshalJSON() ([]byte, error) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	type jobAlias Job
+	return json.Marshal((*jobAlias)(j))
+}
+
+// setRunning marks the job started. Caller (Engine, same package) must not
+// hold any lock of its own — this acquires job.mu itself.
+func (j *Job) setRunning(startedAt time.Time) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.StartedAt = &startedAt
+	j.Status = StatusRunning
+}
+
+// setWorktreeDir records where the job's isolated checkout lives.
+func (j *Job) setWorktreeDir(dir string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.WorktreeDir = dir
+}
+
+// setFailed marks the job failed with a message, without touching ExitCode
+// (used for failures — like worktree setup — that never got far enough to
+// produce one).
+func (j *Job) setFailed(errMsg string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.Status = StatusFailed
+	j.Error = errMsg
+}
+
+// setResult records the outcome of an actually-executed command: its exit
+// code, and the terminal status/error derived from that exit code and the
+// run context (cancelled, timed out, or genuinely passed/failed).
+func (j *Job) setResult(exitCode int, status JobStatus, errMsg string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.ExitCode = exitCode
+	j.Status = status
+	j.Error = errMsg
+}
+
+// setCancelled marks the job cancelled with a reason, refusing to override a
+// job that already reached a terminal state (this is also used by the
+// public Cancel path, where the job may have finished on its own between
+// the caller's IsFinished check and this call).
+func (j *Job) setCancelled(reason string) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.isFinishedLocked() {
+		return false
+	}
+	j.Status = StatusCancelled
+	j.Error = reason
+	return true
+}
+
+// finalize records completion time and, if the job ever started, its total
+// duration. Returns the finish time so callers that need it (e.g. to hand a
+// FinishedAt to the store) don't have to re-lock to read it back.
+func (j *Job) finalize(finishedAt time.Time) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.FinishedAt = &finishedAt
+	if j.StartedAt != nil {
+		j.Duration = finishedAt.Sub(*j.StartedAt)
+	}
 }
 
 // AppendLog adds a log line to memory in a concurrency-safe manner.

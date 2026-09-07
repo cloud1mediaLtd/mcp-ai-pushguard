@@ -81,5 +81,9 @@ func hasMakeTarget(makefilePath, target string) bool {
 			return true
 		}
 	}
+	// A read error here (rather than a genuinely missing target) still means
+	// "don't claim this target exists" — the caller falls through to the
+	// next detection tier either way, so this stays a plain false rather
+	// than surfacing scanner.Err() through a signature change.
 	return false
 }

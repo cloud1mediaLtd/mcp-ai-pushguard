@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pushguard/pushguard/internal/git"
@@ -60,6 +61,10 @@ type Engine struct {
 	cancelsMu     sync.Mutex
 	stopChan      chan struct{}
 	wg            sync.WaitGroup
+
+	// lastActivity is a UnixNano timestamp, updated whenever a job is
+	// enqueued or finishes. It backs the daemon's idle-shutdown timer.
+	lastActivity atomic.Int64
 }
 
 // NewEngine creates and initializes a PushGuard engine.
@@ -78,7 +83,7 @@ func NewEngine(
 		cfg.DefaultTimeout = 10 * time.Minute
 	}
 
-	return &Engine{
+	e := &Engine{
 		config:        cfg,
 		store:         s,
 		worktrees:     wm,
@@ -89,6 +94,26 @@ func NewEngine(
 		cancels:       make(map[string]context.CancelFunc),
 		stopChan:      make(chan struct{}),
 	}
+	e.lastActivity.Store(time.Now().UnixNano())
+	return e
+}
+
+// touchActivity records that the engine did something, resetting the idle clock.
+func (e *Engine) touchActivity() {
+	e.lastActivity.Store(time.Now().UnixNano())
+}
+
+// IdleDuration reports how long it has been since a job was last enqueued or finished.
+func (e *Engine) IdleDuration() time.Duration {
+	return time.Since(time.Unix(0, e.lastActivity.Load()))
+}
+
+// ActiveJobCount returns the number of jobs currently queued or running.
+func (e *Engine) ActiveJobCount() int {
+	e.cancelsMu.Lock()
+	running := len(e.cancels)
+	e.cancelsMu.Unlock()
+	return running + len(e.queue)
 }
 
 // Start launches the worker pool.
@@ -170,6 +195,7 @@ func (e *Engine) Enqueue(req EnqueueRequest) (*Job, int, error) {
 
 	select {
 	case e.queue <- job:
+		e.touchActivity()
 		position := len(e.queue)
 		return job, position, nil
 	default:
@@ -192,13 +218,11 @@ func (e *Engine) workerLoop(workerID int) {
 
 func (e *Engine) executeJob(job *Job) {
 	// If already cancelled while waiting in queue
-	if job.Status == StatusCancelled {
+	if job.IsFinished() {
 		return
 	}
 
-	now := time.Now()
-	job.StartedAt = &now
-	job.Status = StatusRunning
+	job.setRunning(time.Now())
 	_ = e.store.Update(job)
 
 	ctx, cancel := context.WithTimeout(context.Background(), e.config.DefaultTimeout)
@@ -216,12 +240,11 @@ func (e *Engine) executeJob(job *Job) {
 	// 1. Create worktree
 	worktreeDir, err := e.worktrees.CreateWorktree(job.RepoPath, job.ID, job.Ref)
 	if err != nil {
-		job.Status = StatusFailed
-		job.Error = fmt.Sprintf("worktree setup failed: %s", err)
+		job.setFailed(fmt.Sprintf("worktree setup failed: %s", err))
 		e.finalizeJob(job)
 		return
 	}
-	job.WorktreeDir = worktreeDir
+	job.setWorktreeDir(worktreeDir)
 
 	// Guarantee worktree removal
 	defer func() {
@@ -230,16 +253,14 @@ func (e *Engine) executeJob(job *Job) {
 
 	// 2. Run test execution
 	exitCode, runErr := e.runner.Run(ctx, job, worktreeDir)
-	job.ExitCode = exitCode
 
-	if ctx.Err() == context.Canceled {
-		job.Status = StatusCancelled
-		job.Error = "job was cancelled"
-	} else if ctx.Err() == context.DeadlineExceeded {
-		job.Status = StatusFailed
-		job.Error = "test run timed out"
-	} else if exitCode == 0 && runErr == nil {
-		job.Status = StatusPassed
+	switch {
+	case ctx.Err() == context.Canceled:
+		job.setResult(exitCode, StatusCancelled, "job was cancelled")
+	case ctx.Err() == context.DeadlineExceeded:
+		job.setResult(exitCode, StatusFailed, "test run timed out")
+	case exitCode == 0 && runErr == nil:
+		job.setResult(exitCode, StatusPassed, "")
 
 		// Auto-push if requested and branch is valid
 		if job.AutoPush && job.Branch != "" && job.Branch != "HEAD" {
@@ -250,24 +271,22 @@ func (e *Engine) executeJob(job *Job) {
 				job.AppendLog(fmt.Sprintf("[pushguard] successfully pushed %s to origin", job.Branch))
 			}
 		}
-	} else {
-		job.Status = StatusFailed
+	default:
+		errMsg := ""
 		if runErr != nil {
-			job.Error = runErr.Error()
+			errMsg = runErr.Error()
 		}
+		job.setResult(exitCode, StatusFailed, errMsg)
 	}
 
 	e.finalizeJob(job)
 }
 
 func (e *Engine) finalizeJob(job *Job) {
-	finished := time.Now()
-	job.FinishedAt = &finished
-	if job.StartedAt != nil {
-		job.Duration = finished.Sub(*job.StartedAt)
-	}
+	job.finalize(time.Now())
 
 	_ = e.store.Update(job)
+	e.touchActivity()
 
 	if e.notifier != nil {
 		_ = e.notifier.Notify(job)
@@ -281,10 +300,6 @@ func (e *Engine) Cancel(jobID string) error {
 		return err
 	}
 
-	if job.IsFinished() {
-		return fmt.Errorf("job %s is already finished (%s)", jobID, job.Status)
-	}
-
 	e.cancelsMu.Lock()
 	cancel, ok := e.cancels[jobID]
 	e.cancelsMu.Unlock()
@@ -293,8 +308,11 @@ func (e *Engine) Cancel(jobID string) error {
 		cancel()
 	}
 
-	job.Status = StatusCancelled
-	job.Error = "cancelled by user"
+	if !job.setCancelled("cancelled by user") {
+		// Already in a terminal state — e.g. it passed/failed a moment ago.
+		// Report that instead of clobbering a real result with "cancelled".
+		return fmt.Errorf("job %s is already finished", jobID)
+	}
 	_ = e.store.Update(job)
 	return nil
 }
@@ -340,6 +358,30 @@ type CleanReport struct {
 	WorktreesPruned int    `json:"worktrees_pruned"`
 	LogsPruned      int    `json:"logs_pruned"`
 	AllocBytesAfter uint64 `json:"alloc_bytes_after"`
+}
+
+// PruneDiskArtifacts removes stale on-disk state only — orphaned worktrees
+// older than 1 hour and job logs older than 48 hours. Unlike Clean, it never
+// touches the in-memory job store or forces GC, so it's safe to run on a
+// fixed schedule even while the daemon is busy: a job someone queued an hour
+// ago and hasn't checked on yet stays visible to pushguard_list/status. Clean
+// is for winding down (idle-shutdown, or an explicit request); this is for
+// keeping disk usage bounded on a day with no idle gaps at all.
+func (e *Engine) PruneDiskArtifacts() (worktreesPruned, logsPruned int) {
+	activeJobs := make(map[string]bool)
+	e.cancelsMu.Lock()
+	for id := range e.cancels {
+		activeJobs[id] = true
+	}
+	e.cancelsMu.Unlock()
+
+	if e.worktrees != nil {
+		worktreesPruned, _ = e.worktrees.PruneOrphaned(activeJobs, 1*time.Hour)
+	}
+	if lp, ok := e.runner.(LogPruner); ok {
+		logsPruned, _ = lp.PruneOldLogs(48 * time.Hour)
+	}
+	return worktreesPruned, logsPruned
 }
 
 // Clean prunes finished jobs from memory, removes stale worktrees, deletes old logs, and forces GC.
