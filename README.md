@@ -1,4 +1,4 @@
-# PushGuard 🛡️
+# AI MCP PushGuard 🛡️
 
 > **Asynchronous, worktree-isolated local CI & pre-push queue with native MCP support for AI coding agents (Claude Code, ChatGPT, Antigravity, Cursor) and developers.**
 
@@ -74,8 +74,8 @@ When AI coding assistants (Claude Code, ChatGPT/Codex, Antigravity, Cursor) or d
 ### 1. Build the Binary
 
 ```bash
-git clone https://github.com/pushguard/pushguard.git
-cd pushguard
+git clone https://github.com/cloud1mediaLtd/mcp-ai-pushguard.git
+cd mcp-ai-pushguard
 make install
 ```
 *(Installs `pushguard` into `$GOPATH/bin` or `/usr/local/bin`)*
