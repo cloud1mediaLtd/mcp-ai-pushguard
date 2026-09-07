@@ -1,0 +1,6 @@
+/bin/
+/pushguard
+*.log
+*.tmp
+.DS_Store
+.cache/
