@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,18 +23,29 @@ import (
 // dependency on internal/store (which would be fine here, but keeping the
 // daemon package's tests self-contained makes the fixture explicit about
 // exactly what the server needs from a store).
+//
+// The mutex here is not incidental: TestServer_EnqueueAndFetchEndToEnd
+// actually enqueues a real job, so a worker goroutine's Update() and an HTTP
+// handler's List() run concurrently against this store, same as they would
+// against a real one. Without this lock, go test -race catches exactly that
+// (found via CI running these tests for the first time).
 type fakeStore struct {
+	mu   sync.Mutex
 	jobs map[string]*core.Job
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{jobs: make(map[string]*core.Job)} }
 
 func (s *fakeStore) Save(j *core.Job) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.jobs[j.ID] = j
 	return nil
 }
 
 func (s *fakeStore) Get(id string) (*core.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	j, ok := s.jobs[id]
 	if !ok {
 		return nil, fmt.Errorf("job %s not found", id)
@@ -42,6 +54,8 @@ func (s *fakeStore) Get(id string) (*core.Job, error) {
 }
 
 func (s *fakeStore) List(limit int) []*core.Job {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	out := make([]*core.Job, 0, len(s.jobs))
 	for _, j := range s.jobs {
 		out = append(out, j)
@@ -50,11 +64,15 @@ func (s *fakeStore) List(limit int) []*core.Job {
 }
 
 func (s *fakeStore) Update(j *core.Job) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.jobs[j.ID] = j
 	return nil
 }
 
 func (s *fakeStore) Clear(completedOnly bool) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	n := len(s.jobs)
 	s.jobs = make(map[string]*core.Job)
 	return n
