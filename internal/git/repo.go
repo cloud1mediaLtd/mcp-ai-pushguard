@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -45,16 +46,68 @@ func HasUncommittedChanges(repoPath string) (bool, error) {
 	return len(strings.TrimSpace(out)) > 0, nil
 }
 
-// CreateDirtySnapshotCommit creates a git tree object of any uncommitted/staged changes
-// using `git stash create`. It returns a commit SHA representing the exact working state
-// without modifying the working tree or affecting stash list. If tree is clean, returns "".
+// CreateDirtySnapshotCommit builds a commit representing the working tree —
+// tracked modifications AND untracked files — without touching the working tree
+// or the caller's index. Returns "" when there is nothing to snapshot.
+//
+// It used to be `git stash create`, which silently excludes untracked files.
+// That disagreed with HasUncommittedChanges, which uses `git status
+// --porcelain` and DOES count them, so a tree whose only new code sat in a new
+// file was reported dirty and then gated without that file. The failure looks
+// like a genuine compile error in someone else's code:
+//
+//	internal/routing/gateway/router.go:47:2: undefined: injectAuthRuntime
+//
+// while `injectAuthRuntime` is defined perfectly well in an untracked
+// auth_runtime.go. A gate that invents failures is worse than no gate, because
+// people stop trusting red — and the same gap can invent a PASS, by omitting an
+// untracked caller of something the change deleted.
+//
+// The scratch index is what makes this safe: GIT_INDEX_FILE points `git add` at
+// a temporary file, so the caller's staged content is untouched. That matters
+// in a shared checkout where another session may have work staged.
 func CreateDirtySnapshotCommit(repoPath string) (string, error) {
-	out, err := runGit(repoPath, "stash", "create")
+	dirty, err := HasUncommittedChanges(repoPath)
 	if err != nil {
-		return "", fmt.Errorf("failed to create stash snapshot: %w", err)
+		return "", err
 	}
-	sha := strings.TrimSpace(out)
-	return sha, nil
+	if !dirty {
+		return "", nil
+	}
+
+	indexFile, err := os.CreateTemp("", "pushguard-index-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create scratch index: %w", err)
+	}
+	indexPath := indexFile.Name()
+	_ = indexFile.Close()
+	// git wants to create the index itself; an existing empty file is not a
+	// valid index.
+	_ = os.Remove(indexPath)
+	defer func() { _ = os.Remove(indexPath) }()
+
+	env := append(os.Environ(), "GIT_INDEX_FILE="+indexPath)
+
+	// Seed from HEAD so unchanged files carry their existing blobs.
+	if _, err := runGitEnv(repoPath, env, "read-tree", "HEAD"); err != nil {
+		return "", fmt.Errorf("failed to seed scratch index: %w", err)
+	}
+	// -A stages modifications, deletions and untracked files, and still honours
+	// .gitignore — so build output and secrets stay out exactly as they do for
+	// a normal commit.
+	if _, err := runGitEnv(repoPath, env, "add", "-A", "."); err != nil {
+		return "", fmt.Errorf("failed to stage working tree into scratch index: %w", err)
+	}
+	tree, err := runGitEnv(repoPath, env, "write-tree")
+	if err != nil {
+		return "", fmt.Errorf("failed to write snapshot tree: %w", err)
+	}
+	commit, err := runGitEnv(repoPath, env, "commit-tree", strings.TrimSpace(tree), "-p", "HEAD",
+		"-m", "pushguard: working-tree snapshot")
+	if err != nil {
+		return "", fmt.Errorf("failed to commit snapshot tree: %w", err)
+	}
+	return strings.TrimSpace(commit), nil
 }
 
 // Push pushes the current or specified branch to remote.
@@ -73,8 +126,17 @@ func Push(repoPath, branch string) error {
 }
 
 func runGit(dir string, args ...string) (string, error) {
+	return runGitEnv(dir, nil, args...)
+}
+
+// runGitEnv runs git with an explicit environment. A nil env inherits this
+// process's, which is what every caller but the snapshot wants.
+func runGitEnv(dir string, env []string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	if env != nil {
+		cmd.Env = env
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
