@@ -648,13 +648,22 @@ func tailLines(s string, n int) string {
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
-// shortJobRef is the commit a job is testing, abbreviated. With several agents
-// queueing against one repository it is the only column that tells two
-// otherwise-identical gate runs apart.
+// shortRef is the commit a job is actually testing.
+//
+// Job.Ref is that commit: the ref the caller asked for, or the resolved HEAD or
+// working-tree snapshot when they asked for neither. Job.CommitSHA is something
+// else entirely — the branch tip at the moment of enqueue, recorded regardless
+// of --ref.
+//
+// Preferring CommitSHA, as this first did, reports the tip for a job that is
+// deliberately gating an older SHA. That is the dangerous direction: it tells
+// you a release gate covered the tip when it covered a commit from before the
+// fix you are relying on. Caught when a peer enqueued --ref d7ab0d01a, saw the
+// enqueue echo it back correctly, and then saw this column claim 635ee5063.
 func shortJobRef(j *core.Job) string {
-	ref := strings.TrimSpace(j.CommitSHA)
+	ref := strings.TrimSpace(j.Ref)
 	if ref == "" {
-		ref = strings.TrimSpace(j.Ref)
+		ref = strings.TrimSpace(j.CommitSHA)
 	}
 	if ref == "" {
 		return "-"

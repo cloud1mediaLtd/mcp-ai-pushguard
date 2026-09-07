@@ -69,6 +69,21 @@ func (r *LocalRunner) Run(ctx context.Context, job *core.Job, workDir string) (i
 		"CI=true",
 		"PUSHGUARD=1",
 		fmt.Sprintf("PUSHGUARD_JOB_ID=%s", job.ID),
+		// Where the repository actually lives. The worktree is an isolated copy
+		// under the cache directory, so anything resolved RELATIVE to the
+		// checkout — a sibling repository, most obviously — silently finds
+		// nothing here.
+		//
+		// c1m-server's consumers-check is the case that exposed it: it verifies
+		// three sibling repositories are re-vendored against the API contract by
+		// looking for ../platform_fe and friends, and inside a worktree it found
+		// none of them and reported "PASS — 0 consumer(s) current, 3 skipped".
+		// A release whose contract had changed would have been told the
+		// consumers were in sync by a check that looked at nothing.
+		//
+		// Exporting the origin lets a check resolve siblings correctly rather
+		// than be given a flag that tells it to stop caring.
+		fmt.Sprintf("PUSHGUARD_ORIGIN_REPO=%s", job.RepoPath),
 	)
 
 	// Combine stdout & stderr

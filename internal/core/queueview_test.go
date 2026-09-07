@@ -78,3 +78,27 @@ func TestSortForQueueViewIsStableAndNilSafe(t *testing.T) {
 		t.Fatal("a nil entry must sort last rather than panic or lead")
 	}
 }
+
+// The ref column exists to answer "which commit is this testing", and there are
+// two SHAs on a job that look equally plausible.
+//
+// Job.Ref is the commit actually gated — what the caller asked for, or the
+// resolved HEAD or working-tree snapshot when they asked for neither.
+// Job.CommitSHA is the branch tip at the moment of enqueue, recorded regardless
+// of --ref. Reporting the tip for a job deliberately gating an older SHA is the
+// dangerous direction: it claims a release gate covered a fix it did not.
+//
+// This pins the distinction at the source, since both renderers read it.
+func TestJobRefAndCommitSHADisagreeWhenGatingAnOlderCommit(t *testing.T) {
+	// Exactly the shape Engine.Enqueue produces for `--ref <older sha>`.
+	j := &Job{ID: "pg_x", Ref: "d7ab0d01a", CommitSHA: "635ee5063"}
+
+	if j.Ref == j.CommitSHA {
+		t.Fatal("fixture is wrong: the point is that these differ")
+	}
+	// A renderer must show Ref. If this ever becomes CommitSHA again, the
+	// column silently starts lying about what was gated.
+	if got := j.Ref; got != "d7ab0d01a" {
+		t.Fatalf("the gated commit is %q, want the requested ref", got)
+	}
+}
