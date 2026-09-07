@@ -2,6 +2,7 @@
 
 BINARY_NAME=pushguard
 BIN_DIR=bin
+GOPATH_BIN=$(shell go env GOPATH)/bin
 
 all: test build
 
@@ -14,8 +15,9 @@ test:
 	go test -v -race ./...
 
 install: build
-	@cp $(BIN_DIR)/$(BINARY_NAME) $(GOPATH)/bin/$(BINARY_NAME) 2>/dev/null || cp $(BIN_DIR)/$(BINARY_NAME) /usr/local/bin/$(BINARY_NAME) 2>/dev/null || (echo "Please copy $(BIN_DIR)/$(BINARY_NAME) to your PATH" && exit 1)
-	@echo "Installed $(BINARY_NAME) to PATH"
+	@mkdir -p $(GOPATH_BIN)
+	@cp $(BIN_DIR)/$(BINARY_NAME) $(GOPATH_BIN)/$(BINARY_NAME)
+	@echo "Installed $(BINARY_NAME) to $(GOPATH_BIN)/$(BINARY_NAME)"
 
 daemon: build
 	./$(BIN_DIR)/$(BINARY_NAME) daemon
