@@ -481,13 +481,25 @@ func (s *Server) toolList(out io.Writer, id any, args map[string]any) {
 		return
 	}
 
-	var sb strings.Builder
-	sb.WriteString("| ID | Status | Repo | Duration | Command |\n")
-	sb.WriteString("|:---|:---|:---|:---|:---|\n")
+	// Same ordering and columns as the CLI. The queue is shared between agents,
+	// so the questions are "what is running", "what is ahead of mine", and
+	// "which commit is each testing" — and every gate's command string looks
+	// identical, so the ref is what actually distinguishes them.
+	core.SortForQueueView(jobs)
 
+	var sb strings.Builder
+	sb.WriteString("| ID | Status | Queue | Ref | Repo | Duration | Command |\n")
+	sb.WriteString("|:---|:---|:---|:---|:---|:---|:---|\n")
+
+	position := 0
 	for _, j := range jobs {
-		sb.WriteString(fmt.Sprintf("| `%s` | %s | %s | %s | `%s` |\n",
-			j.ID, j.Status, j.Name, j.DurationString(), strings.Join(j.Command, " "),
+		pos := "-"
+		if j.Status == core.StatusQueued {
+			position++
+			pos = fmt.Sprintf("%d", position)
+		}
+		sb.WriteString(fmt.Sprintf("| `%s` | %s | %s | `%s` | %s | %s | `%s` |\n",
+			j.ID, j.Status, pos, shortJobRef(j), j.Name, j.DurationString(), strings.Join(j.Command, " "),
 		))
 	}
 
@@ -634,4 +646,21 @@ func tailLines(s string, n int) string {
 		return s
 	}
 	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
+// shortJobRef is the commit a job is testing, abbreviated. With several agents
+// queueing against one repository it is the only column that tells two
+// otherwise-identical gate runs apart.
+func shortJobRef(j *core.Job) string {
+	ref := strings.TrimSpace(j.CommitSHA)
+	if ref == "" {
+		ref = strings.TrimSpace(j.Ref)
+	}
+	if ref == "" {
+		return "-"
+	}
+	if len(ref) > 9 {
+		return ref[:9]
+	}
+	return ref
 }

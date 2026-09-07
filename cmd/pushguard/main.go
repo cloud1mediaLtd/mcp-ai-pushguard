@@ -297,7 +297,7 @@ func handleList(args []string) {
 		os.Exit(1)
 	}
 
-	jobs, err := c.ListJobs(20)
+	jobs, err := c.ListJobs(30)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
 		os.Exit(1)
@@ -308,17 +308,49 @@ func handleList(args []string) {
 		return
 	}
 
-	fmt.Printf("%-14s %-10s %-25s %-10s %s\n", "JOB ID", "STATUS", "REPOSITORY", "DURATION", "COMMAND")
-	fmt.Println(strings.Repeat("-", 80))
+	// Ordered running → queued (in the order they will run) → finished, because
+	// the questions a second agent actually has are "what is running", "what is
+	// ahead of mine", and only then "what happened recently".
+	core.SortForQueueView(jobs)
+
+	fmt.Printf("%-14s %-10s %-4s %-10s %-24s %-10s %s\n", "JOB ID", "STATUS", "POS", "REF", "REPOSITORY", "DURATION", "COMMAND")
+	fmt.Println(strings.Repeat("-", 108))
+	position := 0
 	for _, j := range jobs {
-		fmt.Printf("%-14s %-10s %-25s %-10s %s\n",
+		// Position is only meaningful for work that has not started. A number
+		// beside a finished job would read as history rather than a queue.
+		pos := "-"
+		if j.Status == core.StatusQueued {
+			position++
+			pos = fmt.Sprintf("%d", position)
+		}
+		fmt.Printf("%-14s %-10s %-4s %-10s %-24s %-10s %s\n",
 			j.ID,
 			j.Status,
-			truncate(j.Name, 25),
+			pos,
+			shortRef(j),
+			truncate(j.Name, 24),
 			j.DurationString(),
-			truncate(strings.Join(j.Command, " "), 25),
+			truncate(strings.Join(j.Command, " "), 40),
 		)
 	}
+}
+
+// shortRef is the single most useful disambiguator when several agents queue
+// against one repository: every job's command looks the same, but the commit
+// under test does not.
+func shortRef(j *core.Job) string {
+	ref := strings.TrimSpace(j.CommitSHA)
+	if ref == "" {
+		ref = strings.TrimSpace(j.Ref)
+	}
+	if ref == "" {
+		return "-"
+	}
+	if len(ref) > 9 {
+		return ref[:9]
+	}
+	return ref
 }
 
 // handleAwait blocks until a job finishes. `enqueue --wait` already covers
