@@ -168,6 +168,44 @@ func (j *Job) finalize(finishedAt time.Time) {
 	}
 }
 
+// MarkOrphaned marks a job that on-disk state says was queued or running as
+// cancelled, with an explanatory reason and a finish timestamp. Exported
+// (unlike the set* helpers above) because it's used by callers outside this
+// package that recover jobs left behind by a crashed or restarted daemon —
+// DurableStore.RecoverOrphans reads jobs back from disk before any engine
+// exists to route the mutation through, so it needs a safe way to touch a
+// *Job's fields without reaching into its private lock. Refuses to overwrite
+// a job that's already terminal (returns false), matching the same guard as
+// the in-process Cancel path.
+func (j *Job) MarkOrphaned(reason string, finishedAt time.Time) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.isFinishedLocked() {
+		return false
+	}
+	j.Status = StatusCancelled
+	j.Error = reason
+	j.FinishedAt = &finishedAt
+	return true
+}
+
+// MarkInterrupted overwrites an already-cancelled job's error message to
+// explain that a daemon shutdown (not a person) caused the cancellation, and
+// backfills FinishedAt if a prior Cancel call somehow didn't set one. Unlike
+// MarkOrphaned this deliberately does overwrite a terminal job: it exists
+// for the exact sequence "Cancel a running job during shutdown, then restate
+// why" — without the second step, a caller who walked away sees a bare
+// "cancelled" that reads as intentional.
+func (j *Job) MarkInterrupted(reason string, finishedAt time.Time) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.Status = StatusCancelled
+	j.Error = reason
+	if j.FinishedAt == nil {
+		j.FinishedAt = &finishedAt
+	}
+}
+
 // AppendLog adds a log line to memory in a concurrency-safe manner.
 func (j *Job) AppendLog(line string) {
 	j.mu.Lock()

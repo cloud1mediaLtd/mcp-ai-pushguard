@@ -571,9 +571,13 @@ func handleDaemon(args []string) {
 				return
 			case <-ticker.C:
 				worktreesPruned, logsPruned := engine.PruneDiskArtifacts()
-				if worktreesPruned > 0 || logsPruned > 0 {
-					fmt.Printf("[pushguard] scheduled disk prune: worktrees pruned=%d, logs pruned=%d\n",
-						worktreesPruned, logsPruned)
+				jobRecordsPruned, err := jobStore.PruneOld(48 * time.Hour)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[pushguard] scheduled job-record prune failed: %s\n", err)
+				}
+				if worktreesPruned > 0 || logsPruned > 0 || jobRecordsPruned > 0 {
+					fmt.Printf("[pushguard] scheduled disk prune: worktrees pruned=%d, logs pruned=%d, job records pruned=%d\n",
+						worktreesPruned, logsPruned, jobRecordsPruned)
 				}
 			}
 		}
@@ -631,12 +635,7 @@ func handleDaemon(args []string) {
 	for _, job := range inFlight {
 		// Cancel already moved these to cancelled; restate WHY, because
 		// "cancelled" alone reads as somebody having cancelled it on purpose.
-		job.Error = "daemon shut down while this job was in flight; it did not run to completion — re-enqueue it"
-		if job.FinishedAt == nil {
-			finished := time.Now()
-			job.FinishedAt = &finished
-		}
-		job.Status = core.StatusCancelled
+		job.MarkInterrupted("daemon shut down while this job was in flight; it did not run to completion — re-enqueue it", time.Now())
 		_ = jobStore.Update(job)
 
 		worktreeDir := job.WorktreeDir

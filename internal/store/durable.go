@@ -147,6 +147,52 @@ func (s *DurableStore) Clear(completedOnly bool) int {
 	return n
 }
 
+// PruneOld deletes on-disk records for jobs that finished more than maxAge
+// ago. Unlike Clear, this never touches the in-memory store — a job's
+// presence in pushguard_list/status is unaffected — and it only ever
+// considers jobs that are themselves recorded as finished, so a queued or
+// running job is never at risk regardless of how old its CreatedAt is.
+//
+// This exists because RecoverOrphans scans this whole directory on every
+// daemon startup, and the daemon's idle-shutdown lifecycle means startups
+// are routine now, not rare. Without an age-based prune independent of a
+// full Clean(), a daemon that's busy all day (and so never idles long
+// enough to trigger Clean) accumulates one file per job here forever; this
+// keeps that directory — and therefore startup's scan of it — bounded on
+// its own schedule.
+func (s *DurableStore) PruneOld(maxAge time.Duration) (int, error) {
+	if s.dir == "" {
+		return 0, nil
+	}
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return 0, err
+	}
+	cutoff := time.Now().Add(-maxAge)
+	pruned := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		job, err := s.readFromDisk(id)
+		if err != nil || !job.IsFinished() || job.FinishedAt == nil {
+			continue
+		}
+		if job.FinishedAt.Before(cutoff) {
+			if path := s.path(id); path != "" {
+				s.mu.Lock()
+				removeErr := os.Remove(path)
+				s.mu.Unlock()
+				if removeErr == nil {
+					pruned++
+				}
+			}
+		}
+	}
+	return pruned, nil
+}
+
 // RecoverOrphans marks jobs that disk says were queued or running as cancelled,
 // and returns them.
 //
@@ -175,10 +221,14 @@ func (s *DurableStore) RecoverOrphans() []*core.Job {
 			continue
 		}
 		wasStatus := string(job.Status)
-		job.Status = core.StatusCancelled
-		job.Error = "daemon restarted while this job was " + wasStatus + "; it did not run to completion — re-enqueue it"
-		finished := time.Now()
-		job.FinishedAt = &finished
+		reason := "daemon restarted while this job was " + wasStatus + "; it did not run to completion — re-enqueue it"
+		if !job.MarkOrphaned(reason, time.Now()) {
+			// Raced with something else finishing it between the IsFinished
+			// check above and the lock inside MarkOrphaned — vanishingly
+			// unlikely at startup (nothing else is running yet), but correct
+			// to just skip rather than persist a stale snapshot either way.
+			continue
+		}
 		s.persist(job)
 		orphans = append(orphans, job)
 	}

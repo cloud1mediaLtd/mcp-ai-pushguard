@@ -119,6 +119,62 @@ func TestDurableStoreRefusesAnIDThatEscapesItsDirectory(t *testing.T) {
 	}
 }
 
+// PruneOld is what keeps ~/.pushguard/jobs bounded on a daemon that's busy
+// all day and never idles long enough to trigger a full Clean() — it must
+// remove only jobs both finished AND older than maxAge, never a queued or
+// running one regardless of age, and never touch the in-memory store.
+func TestDurableStore_PruneOldRemovesOnlyOldFinishedJobs(t *testing.T) {
+	dir := t.TempDir()
+	s := NewDurable(NewMemoryStore(10), dir)
+
+	old := queuedJob("pg_old_finished")
+	old.Status = core.StatusPassed
+	oldFinish := time.Now().Add(-72 * time.Hour)
+	old.FinishedAt = &oldFinish
+	if err := s.Save(old); err != nil {
+		t.Fatalf("save old: %v", err)
+	}
+
+	recent := queuedJob("pg_recent_finished")
+	recent.Status = core.StatusFailed
+	recentFinish := time.Now().Add(-1 * time.Hour)
+	recent.FinishedAt = &recentFinish
+	if err := s.Save(recent); err != nil {
+		t.Fatalf("save recent: %v", err)
+	}
+
+	stillRunning := queuedJob("pg_old_but_running")
+	stillRunning.Status = core.StatusRunning
+	stillRunning.CreatedAt = time.Now().Add(-72 * time.Hour)
+	if err := s.Save(stillRunning); err != nil {
+		t.Fatalf("save running: %v", err)
+	}
+
+	pruned, err := s.PruneOld(48 * time.Hour)
+	if err != nil {
+		t.Fatalf("PruneOld failed: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("expected exactly 1 pruned record, got %d", pruned)
+	}
+
+	if _, err := s.readFromDisk("pg_old_finished"); err == nil {
+		t.Fatal("expected the old finished job's disk record to be gone")
+	}
+	if _, err := s.readFromDisk("pg_recent_finished"); err != nil {
+		t.Fatalf("recent finished job should survive: %v", err)
+	}
+	if _, err := s.readFromDisk("pg_old_but_running"); err != nil {
+		t.Fatalf("a still-running job must never be pruned regardless of age: %v", err)
+	}
+
+	// In-memory presence (what pushguard_list/status actually reads from in
+	// the common case) must be completely untouched by a disk-only prune.
+	if _, err := s.inner.Get("pg_old_finished"); err != nil {
+		t.Fatalf("PruneOld must not touch the in-memory store: %v", err)
+	}
+}
+
 func contains(haystack, needle string) bool {
 	return len(haystack) >= len(needle) && (haystack == needle || len(needle) == 0 ||
 		func() bool {
