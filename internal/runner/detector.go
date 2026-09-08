@@ -58,8 +58,8 @@ func DetectCommand(dir string) DetectedSuite {
 		return DetectedSuite{Command: []string{"pytest"}, Source: "Python configuration"}
 	}
 
-	// Fallback generic
-	return DetectedSuite{Command: []string{"echo", "No automated test suite detected"}, Source: "fallback"}
+	// No suite means no verification: callers must require an explicit command.
+	return DetectedSuite{Source: "fallback"}
 }
 
 func fileExists(path string) bool {

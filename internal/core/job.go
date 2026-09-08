@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -23,23 +24,30 @@ const (
 
 // Job represents a queued or executed verification run.
 type Job struct {
-	ID          string        `json:"id"`
-	Name        string        `json:"name,omitempty"`
-	RepoPath    string        `json:"repo_path"`
-	Ref         string        `json:"ref"`
-	CommitSHA   string        `json:"commit_sha,omitempty"`
-	Branch      string        `json:"branch,omitempty"`
-	Command     []string      `json:"command"`
-	AutoPush    bool          `json:"auto_push"`
-	Status      JobStatus     `json:"status"`
-	ExitCode    int           `json:"exit_code"`
-	Error       string        `json:"error,omitempty"`
-	CreatedAt   time.Time     `json:"created_at"`
-	StartedAt   *time.Time    `json:"started_at,omitempty"`
-	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
-	Duration    time.Duration `json:"duration_ns,omitempty"`
-	WorktreeDir string        `json:"worktree_dir,omitempty"`
-	LogFilePath string        `json:"log_file_path,omitempty"`
+	ID           string        `json:"id"`
+	Name         string        `json:"name,omitempty"`
+	RepoPath     string        `json:"repo_path"`
+	Ref          string        `json:"ref"`
+	RequestedRef string        `json:"requested_ref,omitempty"`
+	SourceKind   string        `json:"source_kind,omitempty"`
+	BaseSHA      string        `json:"base_sha,omitempty"`
+	Timeout      time.Duration `json:"timeout_ns,omitempty"`
+	CommitSHA    string        `json:"commit_sha,omitempty"`
+	Branch       string        `json:"branch,omitempty"`
+	Command      []string      `json:"command"`
+	AutoPush     bool          `json:"auto_push"`
+	Status       JobStatus     `json:"status"`
+	ExitCode     int           `json:"exit_code"`
+	Error        string        `json:"error,omitempty"`
+	CreatedAt    time.Time     `json:"created_at"`
+	StartedAt    *time.Time    `json:"started_at,omitempty"`
+	FinishedAt   *time.Time    `json:"finished_at,omitempty"`
+	Duration     time.Duration `json:"duration_ns,omitempty"`
+	WorktreeDir  string        `json:"worktree_dir,omitempty"`
+	LogFilePath  string        `json:"log_file_path,omitempty"`
+	DaemonBuild  string        `json:"daemon_build,omitempty"`
+	DedupeKey    string        `json:"dedupe_key,omitempty"`
+	Reused       bool          `json:"reused,omitempty"`
 
 	mu   sync.RWMutex
 	logs []string
@@ -47,12 +55,80 @@ type Job struct {
 
 // EnqueueRequest encapsulates parameters to schedule a new test job.
 type EnqueueRequest struct {
-	RepoPath string        `json:"repo_path"`
-	Ref      string        `json:"ref,omitempty"`
-	Command  []string      `json:"command,omitempty"`
-	Name     string        `json:"name,omitempty"`
-	AutoPush bool          `json:"auto_push,omitempty"`
-	Timeout  time.Duration `json:"timeout_seconds,omitempty"`
+	RepoPath  string        `json:"repo_path"`
+	Ref       string        `json:"ref,omitempty"`
+	Command   []string      `json:"command,omitempty"`
+	Name      string        `json:"name,omitempty"`
+	AutoPush  bool          `json:"auto_push,omitempty"`
+	Timeout   time.Duration `json:"-"`
+	Snapshot  bool          `json:"snapshot,omitempty"`
+	DedupeKey string        `json:"dedupe_key,omitempty"`
+}
+
+// MarshalJSON expresses request timeouts in whole seconds on the wire.
+func (r EnqueueRequest) MarshalJSON() ([]byte, error) {
+	if r.Timeout < 0 || r.Timeout%time.Second != 0 {
+		return nil, fmt.Errorf("timeout must be a nonnegative whole number of seconds")
+	}
+	type requestAlias EnqueueRequest
+	return json.Marshal(struct {
+		requestAlias
+		TimeoutSeconds int64 `json:"timeout_seconds,omitempty"`
+	}{requestAlias(r), int64(r.Timeout / time.Second)})
+}
+
+// UnmarshalJSON rejects fractional, negative and overflowing timeout seconds.
+func (r *EnqueueRequest) UnmarshalJSON(data []byte) error {
+	type requestAlias EnqueueRequest
+	var wire struct {
+		requestAlias
+		TimeoutSeconds int64 `json:"timeout_seconds,omitempty"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.TimeoutSeconds < 0 || wire.TimeoutSeconds > math.MaxInt64/int64(time.Second) {
+		return fmt.Errorf("timeout_seconds is out of range")
+	}
+	*r = EnqueueRequest(wire.requestAlias)
+	r.Timeout = time.Duration(wire.TimeoutSeconds) * time.Second
+	return nil
+}
+
+// SetLogFilePath records the log location without racing status readers.
+func (j *Job) SetLogFilePath(path string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.LogFilePath = path
+}
+
+// Snapshot returns a detached, immutable-to-the-caller view, including log history.
+func (j *Job) Snapshot() *Job {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	out := &Job{ID: j.ID, Name: j.Name, RepoPath: j.RepoPath, Ref: j.Ref,
+		RequestedRef: j.RequestedRef, SourceKind: j.SourceKind, BaseSHA: j.BaseSHA,
+		Timeout: j.Timeout, CommitSHA: j.CommitSHA, Branch: j.Branch,
+		Command: append([]string(nil), j.Command...), AutoPush: j.AutoPush,
+		Status: j.Status, ExitCode: j.ExitCode, Error: j.Error, CreatedAt: j.CreatedAt,
+		Duration: j.Duration, WorktreeDir: j.WorktreeDir, LogFilePath: j.LogFilePath, DaemonBuild: j.DaemonBuild, DedupeKey: j.DedupeKey, Reused: j.Reused,
+		logs: append([]string(nil), j.logs...)}
+	if j.StartedAt != nil {
+		t := *j.StartedAt
+		out.StartedAt = &t
+	}
+	if j.FinishedAt != nil {
+		t := *j.FinishedAt
+		out.FinishedAt = &t
+	}
+	return out
+}
+
+// StatusValue returns the current state under the job lock.
+func (j *Job) StatusValue() JobStatus {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.Status
 }
 
 // GenerateJobID generates a unique identifier for a job: e.g. pg_a1b2c3d4e5
@@ -157,8 +233,7 @@ func (j *Job) setCancelled(reason string) bool {
 }
 
 // finalize records completion time and, if the job ever started, its total
-// duration. Returns the finish time so callers that need it (e.g. to hand a
-// FinishedAt to the store) don't have to re-lock to read it back.
+// duration.
 func (j *Job) finalize(finishedAt time.Time) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -210,6 +285,9 @@ func (j *Job) MarkInterrupted(reason string, finishedAt time.Time) {
 func (j *Job) AppendLog(line string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if len(line) > 64*1024 {
+		line = line[:64*1024]
+	}
 	j.logs = append(j.logs, line)
 	if len(j.logs) > 2000 {
 		j.logs = j.logs[len(j.logs)-2000:]
@@ -220,7 +298,7 @@ func (j *Job) AppendLog(line string) {
 func (j *Job) TailLogs(n int) string {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
-	if len(j.logs) == 0 {
+	if len(j.logs) == 0 || n <= 0 {
 		return ""
 	}
 	start := 0

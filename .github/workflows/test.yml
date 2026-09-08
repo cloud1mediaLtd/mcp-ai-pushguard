@@ -26,10 +26,8 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
+      - name: Quality gate
         env:
           PUSHGUARD_NO_AUTOSPAWN: "1"
-        run: go test -race -cover ./...
+          PUSHGUARD_REDIS_ADDR: ""
+        run: make check

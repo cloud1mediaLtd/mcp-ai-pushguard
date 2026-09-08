@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -24,6 +25,15 @@ func GetHeadSHA(repoPath string) (string, error) {
 	out, err := runGit(repoPath, "rev-parse", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("failed to get HEAD sha: %w", err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// ResolveCommit resolves a revision to one immutable commit, rejecting trees and blobs.
+func ResolveCommit(repoPath, ref string) (string, error) {
+	out, err := runGit(repoPath, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("resolve commit %q: %w", ref, err)
 	}
 	return strings.TrimSpace(out), nil
 }
@@ -67,14 +77,15 @@ func HasUncommittedChanges(repoPath string) (bool, error) {
 // a temporary file, so the caller's staged content is untouched. That matters
 // in a shared checkout where another session may have work staged.
 func CreateDirtySnapshotCommit(repoPath string) (string, error) {
-	dirty, err := HasUncommittedChanges(repoPath)
+	base, err := ResolveCommit(repoPath, "HEAD")
 	if err != nil {
 		return "", err
 	}
-	if !dirty {
-		return "", nil
-	}
+	return CreateSnapshotCommit(repoPath, base)
+}
 
+// CreateSnapshotCommit snapshots working files against an already resolved parent.
+func CreateSnapshotCommit(repoPath, baseSHA string) (string, error) {
 	indexFile, err := os.CreateTemp("", "pushguard-index-*")
 	if err != nil {
 		return "", fmt.Errorf("failed to create scratch index: %w", err)
@@ -89,7 +100,7 @@ func CreateDirtySnapshotCommit(repoPath string) (string, error) {
 	env := append(os.Environ(), "GIT_INDEX_FILE="+indexPath)
 
 	// Seed from HEAD so unchanged files carry their existing blobs.
-	if _, err := runGitEnv(repoPath, env, "read-tree", "HEAD"); err != nil {
+	if _, err := runGitEnv(repoPath, env, "read-tree", baseSHA); err != nil {
 		return "", fmt.Errorf("failed to seed scratch index: %w", err)
 	}
 	// -A stages modifications, deletions and untracked files, and still honours
@@ -102,7 +113,14 @@ func CreateDirtySnapshotCommit(repoPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to write snapshot tree: %w", err)
 	}
-	commit, err := runGitEnv(repoPath, env, "commit-tree", strings.TrimSpace(tree), "-p", "HEAD",
+	baseTree, err := runGit(repoPath, "rev-parse", "--verify", "--end-of-options", baseSHA+"^{tree}")
+	if err != nil {
+		return "", fmt.Errorf("resolve snapshot base tree: %w", err)
+	}
+	if strings.TrimSpace(tree) == strings.TrimSpace(baseTree) {
+		return "", nil
+	}
+	commit, err := runGitEnv(repoPath, env, "commit-tree", strings.TrimSpace(tree), "-p", baseSHA,
 		"-m", "pushguard: working-tree snapshot")
 	if err != nil {
 		return "", fmt.Errorf("failed to commit snapshot tree: %w", err)
@@ -132,7 +150,22 @@ func runGit(dir string, args ...string) (string, error) {
 // runGitEnv runs git with an explicit environment. A nil env inherits this
 // process's, which is what every caller but the snapshot wants.
 func runGitEnv(dir string, env []string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return runGitContext(ctx, dir, env, args...)
+}
+
+func runGitContext(ctx context.Context, dir string, env []string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = dir
 	if env != nil {
 		cmd.Env = env

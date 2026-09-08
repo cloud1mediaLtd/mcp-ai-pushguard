@@ -147,3 +147,29 @@ func TestSnapshotOfACleanTreeReturnsNothing(t *testing.T) {
 		t.Fatalf("a clean tree needs no snapshot, got %q", sha)
 	}
 }
+
+func TestSnapshotUsesResolvedParentAfterHeadMoves(t *testing.T) {
+	repo := setupTestGitRepo(t)
+	defer os.RemoveAll(repo)
+	base, err := GetHeadSHA(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("new head content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, repo, "git", "add", "file.txt")
+	runCmd(t, repo, "git", "commit", "-m", "advance head")
+	snapshot, err := CreateSnapshotCommit(repo, base)
+	if err != nil || snapshot == "" {
+		t.Fatalf("snapshot against resolved parent: %q %v", snapshot, err)
+	}
+	parent, err := runGit(repo, "rev-parse", snapshot+"^")
+	if err != nil || strings.TrimSpace(parent) != base {
+		t.Fatalf("snapshot parent drifted: %q %v", parent, err)
+	}
+	content, err := runGit(repo, "show", snapshot+":file.txt")
+	if err != nil || content != "new head content" {
+		t.Fatalf("snapshot missed clean moved-head files: %q %v", content, err)
+	}
+}

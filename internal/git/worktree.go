@@ -1,9 +1,12 @@
 package git
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -15,6 +18,9 @@ type WorktreeManager struct {
 // NewWorktreeManager creates a manager storing worktrees in baseDir.
 // If baseDir is empty, defaults to ~/.cache/pushguard/worktrees.
 func NewWorktreeManager(baseDir string) (*WorktreeManager, error) {
+	if baseDir == "" && os.Getenv("PUSHGUARD_STATE_DIR") != "" {
+		baseDir = filepath.Join(os.Getenv("PUSHGUARD_STATE_DIR"), "worktrees")
+	}
 	if baseDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -23,6 +29,11 @@ func NewWorktreeManager(baseDir string) (*WorktreeManager, error) {
 			baseDir = filepath.Join(home, ".cache", "pushguard", "worktrees")
 		}
 	}
+	absoluteBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve worktree base directory: %w", err)
+	}
+	baseDir = absoluteBase
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create worktree base directory %q: %w", baseDir, err)
 	}
@@ -31,34 +42,77 @@ func NewWorktreeManager(baseDir string) (*WorktreeManager, error) {
 
 // CreateWorktree creates a detached worktree for the specified ref in a unique directory.
 func (m *WorktreeManager) CreateWorktree(repoPath, jobID, ref string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	return m.CreateWorktreeContext(ctx, repoPath, jobID, ref)
+}
+
+// CreateWorktreeContext creates a new checkout within the manager's owned directory.
+func (m *WorktreeManager) CreateWorktreeContext(ctx context.Context, repoPath, jobID, ref string) (string, error) {
+	if jobID == "" || filepath.Base(jobID) != jobID || jobID == "." || jobID == ".." {
+		return "", fmt.Errorf("invalid job id")
+	}
 	targetDir := filepath.Join(m.BaseDir, jobID)
-
-	// Clean up any stale directory at target
-	if _, err := os.Stat(targetDir); err == nil {
-		_ = m.RemoveWorktree(repoPath, targetDir)
+	if _, err := os.Lstat(targetDir); err == nil {
+		return "", fmt.Errorf("worktree path already exists: %s", targetDir)
+	} else if !os.IsNotExist(err) {
+		return "", err
 	}
-
-	// git worktree add --detach <targetDir> <ref>
-	_, err := runGit(repoPath, "worktree", "add", "--detach", targetDir, ref)
-	if err != nil {
-		return "", fmt.Errorf("failed to add git worktree: %w", err)
+	if _, err := runGitContext(ctx, repoPath, nil, "worktree", "add", "--detach", targetDir, ref); err != nil {
+		// Git normally rolls back interrupted checkout itself. If registration
+		// survived, remove only that registered worktree, never an arbitrary path.
+		cleanupErr := m.RemoveWorktree(repoPath, targetDir)
+		return "", errors.Join(fmt.Errorf("failed to add git worktree: %w", err), cleanupErr)
 	}
-
 	return targetDir, nil
 }
 
-// RemoveWorktree safely unlinks and cleans up a worktree.
+// RemoveWorktree removes only a registered direct child of the manager's base.
 func (m *WorktreeManager) RemoveWorktree(repoPath, targetDir string) error {
-	// Try git worktree remove --force
-	_, _ = runGit(repoPath, "worktree", "remove", "--force", targetDir)
-	_, _ = runGit(repoPath, "worktree", "prune")
-
-	// Ensure filesystem cleanup
-	_ = os.RemoveAll(targetDir)
+	base, err := filepath.Abs(m.BaseDir)
+	if err != nil {
+		return err
+	}
+	target, err := filepath.Abs(targetDir)
+	if err != nil {
+		return err
+	}
+	if filepath.Dir(target) != base {
+		return fmt.Errorf("refusing worktree outside owned directory: %s", target)
+	}
+	if info, err := os.Lstat(target); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing symlink worktree: %s", target)
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	out, err := runGit(repoPath, "worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return fmt.Errorf("inspect registered worktrees: %w", err)
+	}
+	canonicalTarget := target
+	if resolved, err := filepath.EvalSymlinks(target); err == nil {
+		canonicalTarget = resolved
+	}
+	registered := false
+	for _, line := range strings.Split(out, "\x00") {
+		if strings.TrimPrefix(line, "worktree ") == canonicalTarget && strings.HasPrefix(line, "worktree ") {
+			registered = true
+			break
+		}
+	}
+	if !registered {
+		if _, err := os.Lstat(target); os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("refusing unregistered worktree: %s", target)
+	}
+	if _, err := runGit(repoPath, "worktree", "remove", "--force", target); err != nil {
+		return fmt.Errorf("remove worktree: %w", err)
+	}
 	return nil
 }
 
-// PruneOrphaned removes any worktrees in BaseDir not present in activeJobIDs or older than maxAge.
+// PruneOrphaned removes stale registered worktrees, preserving active and unknown directories.
 func (m *WorktreeManager) PruneOrphaned(activeJobIDs map[string]bool, maxAge time.Duration) (int, error) {
 	entries, err := os.ReadDir(m.BaseDir)
 	if err != nil {
@@ -85,7 +139,13 @@ func (m *WorktreeManager) PruneOrphaned(activeJobIDs map[string]bool, maxAge tim
 		}
 
 		dirPath := filepath.Join(m.BaseDir, jobID)
-		_ = os.RemoveAll(dirPath)
+		common, err := runGit(dirPath, "rev-parse", "--path-format=absolute", "--git-common-dir")
+		if err != nil {
+			continue
+		} // Unknown directories are not ours to remove.
+		if err := m.RemoveWorktree(strings.TrimSpace(common), dirPath); err != nil {
+			return pruned, err
+		}
 		pruned++
 	}
 

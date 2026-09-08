@@ -1,14 +1,16 @@
 package runner
 
 import (
-	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pushguard/pushguard/internal/core"
@@ -27,6 +29,9 @@ type LocalRunner struct {
 
 // NewLocalRunner creates a new process runner, placing logs in logBaseDir.
 func NewLocalRunner(logBaseDir string) (*LocalRunner, error) {
+	if logBaseDir == "" && os.Getenv("PUSHGUARD_STATE_DIR") != "" {
+		logBaseDir = filepath.Join(os.Getenv("PUSHGUARD_STATE_DIR"), "logs")
+	}
 	if logBaseDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -42,19 +47,24 @@ func NewLocalRunner(logBaseDir string) (*LocalRunner, error) {
 }
 
 // Run executes the job's command in the workDir.
-func (r *LocalRunner) Run(ctx context.Context, job *core.Job, workDir string) (int, error) {
+func (r *LocalRunner) Run(ctx context.Context, job *core.Job, workDir string) (exitCode int, runErr error) {
 	if len(job.Command) == 0 {
 		return 1, fmt.Errorf("empty test command")
 	}
 
 	logFilePath := filepath.Join(r.LogBaseDir, fmt.Sprintf("%s.log", job.ID))
-	job.LogFilePath = logFilePath
+	job.SetLogFilePath(logFilePath)
 
 	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return 1, fmt.Errorf("failed to open log file %q: %w", logFilePath, err)
 	}
-	defer logFile.Close()
+	defer func() {
+		if err := logFile.Close(); err != nil {
+			exitCode = 1
+			runErr = errors.Join(runErr, fmt.Errorf("close job log: %w", err))
+		}
+	}()
 
 	var cmd *exec.Cmd
 	if len(job.Command) == 1 {
@@ -86,59 +96,103 @@ func (r *LocalRunner) Run(ctx context.Context, job *core.Job, workDir string) (i
 		fmt.Sprintf("PUSHGUARD_ORIGIN_REPO=%s", job.RepoPath),
 	)
 
-	// Combine stdout & stderr
-	pr, pw := io.Pipe()
-	cmd.Stdout = pw
-	cmd.Stderr = pw
+	// A command may start make, shells, compilers, and smoke servers. Give
+	// them a group so cancelling the job stops its descendants as well.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return killProcessGroup(cmd.Process.Pid) }
+	// Bound inherited output pipes even if a child escapes the process group.
+	cmd.WaitDelay = 2 * time.Second
 
-	// Stream reader
-	doneReader := make(chan struct{})
-	go func() {
-		defer close(doneReader)
-		scanner := bufio.NewScanner(pr)
-		// Default 64KB max token size is too easy to exceed for build/test
-		// output (a long JSON line, a Go race-detector stack dump). Without
-		// raising this, Scan() silently stops on bufio.ErrTooLong and the
-		// rest of the run's output just never reaches the log — indistinguishable
-		// from the process going quiet. 1MB covers realistic worst cases here.
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			text := scanner.Text()
-			job.AppendLog(text)
-			_, _ = fmt.Fprintln(logFile, text)
-		}
-		if err := scanner.Err(); err != nil {
-			note := fmt.Sprintf("[pushguard] log capture stopped early: %s (output above may be incomplete)", err)
-			job.AppendLog(note)
-			_, _ = fmt.Fprintln(logFile, note)
-		}
-	}()
+	capture := &logCapture{disk: logFile, job: job}
+	cmd.Stdout = capture
+	cmd.Stderr = capture
+	defer capture.flush()
 
-	startMsg := fmt.Sprintf("[pushguard] Starting '%s' in %s", strings.Join(job.Command, " "), workDir)
-	job.AppendLog(startMsg)
-	_, _ = fmt.Fprintln(logFile, startMsg)
-
+	startMsg := fmt.Sprintf("[pushguard] daemon_build=%s job=%s starting '%s' in %s\n", job.DaemonBuild, job.ID, strings.Join(job.Command, " "), workDir)
+	if _, err := capture.Write([]byte(startMsg)); err != nil {
+		return 1, fmt.Errorf("write job log: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
-		_ = pw.Close()
-		<-doneReader
 		return 1, fmt.Errorf("failed to start command: %w", err)
 	}
 
 	waitErr := cmd.Wait()
-	_ = pw.Close()
-	<-doneReader
-
+	// Also stop background children left behind by a command that has exited.
+	cleanupErr := killProcessGroup(cmd.Process.Pid)
+	if errors.Is(cleanupErr, os.ErrProcessDone) {
+		cleanupErr = nil
+	}
+	if ctx.Err() != nil {
+		return 130, errors.Join(ctx.Err(), capture.err, cleanupErr)
+	}
+	if capture.err != nil || cleanupErr != nil {
+		return 1, errors.Join(capture.err, cleanupErr)
+	}
 	if waitErr != nil {
-		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
 			return exitErr.ExitCode(), nil
 		}
-		if ctx.Err() != nil {
-			return 130, ctx.Err()
-		}
-		return 1, waitErr
+		return 1, fmt.Errorf("wait for command: %w", waitErr)
 	}
-
 	return 0, nil
+}
+
+func killProcessGroup(pid int) error {
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return fmt.Errorf("stop command process group: %w", err)
+	}
+	return nil
+}
+
+const maxLogChunkBytes = 64 * 1024
+
+// logCapture preserves raw output on disk while retaining bounded lines or
+// chunks in memory. os/exec serializes writes when stdout and stderr share
+// the same writer; flush is called only after Wait has joined its copier.
+type logCapture struct {
+	disk    io.Writer
+	job     *core.Job
+	pending []byte
+	err     error
+}
+
+func (c *logCapture) Write(p []byte) (int, error) {
+	n, err := c.disk.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		c.err = fmt.Errorf("capture job output: %w", err)
+	}
+	remaining := p[:n]
+	for len(remaining) > 0 {
+		size := min(len(remaining), maxLogChunkBytes-len(c.pending))
+		newline := bytes.IndexByte(remaining[:size], '\n')
+		if newline >= 0 {
+			c.pending = append(c.pending, remaining[:newline]...)
+			c.job.AppendLog(string(c.pending))
+			c.pending = c.pending[:0]
+			remaining = remaining[newline+1:]
+			continue
+		}
+		c.pending = append(c.pending, remaining[:size]...)
+		remaining = remaining[size:]
+		if len(c.pending) == maxLogChunkBytes {
+			c.flush()
+		}
+	}
+	return n, err
+}
+
+func (c *logCapture) flush() {
+	if len(c.pending) > 0 {
+		c.job.AppendLog(string(c.pending))
+		c.pending = c.pending[:0]
+	}
 }
 
 // PruneOldLogs deletes log files older than maxAge. If maxAge <= 0, defaults to 48 hours.

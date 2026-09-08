@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,10 +21,18 @@ import (
 	"github.com/pushguard/pushguard/internal/notifier"
 	"github.com/pushguard/pushguard/internal/runner"
 	"github.com/pushguard/pushguard/internal/store"
+	"github.com/pushguard/pushguard/internal/verification/application"
+	"github.com/pushguard/pushguard/pkg/api"
 	"github.com/pushguard/pushguard/pkg/client"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
+
+// BuildCommit is injected by release builds. A source build stays explicit so
+// a daemon and client built from different source revisions cannot look equal.
+var BuildCommit = "dev"
+
+func buildID() string { return Version + "+" + BuildCommit }
 
 func printUsage() {
 	fmt.Printf(`PushGuard (v%s)
@@ -33,6 +43,7 @@ Usage:
 
 Commands:
   enqueue, run   Enqueue checks for a repository in an isolated worktree
+  await, wait    Wait for a completed verdict (default: 1500 seconds)
   status         Check status, results, and logs for a job
   list           List queued, running, and recent jobs
   cancel         Cancel a queued or active job
@@ -44,8 +55,9 @@ Commands:
 
 Examples:
   pushguard enqueue --repo .
-  pushguard enqueue --repo ./backend --cmd "go test ./..." --auto-push
-  pushguard status pg_a1b2c3d4
+	pushguard enqueue --repo ./backend --cmd "go test ./..." --ref HEAD
+	pushguard status pg_a1b2c3d4
+	pushguard list --ref <commit> --limit 10
   pushguard clean
   pushguard mcp
   pushguard daemon --concurrency 2
@@ -91,156 +103,142 @@ func main() {
 	}
 }
 
-func handleEnqueue(args []string) {
-	fs := flag.NewFlagSet("enqueue", flag.ExitOnError)
+const exitSubmissionFailed = 4
+
+func handleEnqueue(args []string) { os.Exit(runEnqueue(args)) }
+
+func daemonClient(socket string) *client.Client {
+	return client.New(socket, client.WithBuild(buildID()))
+}
+
+func runEnqueue(args []string) int { return runEnqueueWithClient(args, daemonClient("")) }
+
+func runEnqueueWithClient(args []string, c *client.Client) int {
+	fs := flag.NewFlagSet("enqueue", flag.ContinueOnError)
 	repo := fs.String("repo", ".", "Path to repository")
-	ref := fs.String("ref", "HEAD", "Git ref or commit (default: HEAD / dirty snapshot)")
-	cmdStr := fs.String("cmd", "", "Command to run (auto-detected if empty)")
-	autoPush := fs.Bool("auto-push", false, "Automatically git push upon green test run")
-	wait := fs.Bool("wait", false, "Wait synchronously for completion")
-	timeoutSec := fs.Int("timeout", 600, "Timeout in seconds")
-	_ = fs.Parse(args)
-
-	var cmd []string
-	if *cmdStr != "" {
-		cmd = strings.Fields(*cmdStr)
+	ref := fs.String("ref", "", "Committed Git ref (default: HEAD)")
+	snapshot := fs.Bool("snapshot", false, "Explicitly snapshot working-tree changes; cannot combine with --ref")
+	cmdStr := fs.String("cmd", "", "Shell command to run (auto-detected if empty)")
+	autoPush := fs.Bool("auto-push", false, "Disabled: pushing requires a separate action")
+	wait := fs.Bool("wait", false, "Wait for completion")
+	timeoutSec := fs.Int("timeout", 900, "Execution timeout in seconds")
+	waitSec := fs.Int("wait-timeout", 1500, "Seconds to wait, including queue time")
+	dedupeKey := fs.String("dedupe-key", "", "Reuse an active job with this verification identity")
+	if err := fs.Parse(args); err != nil {
+		return exitSubmissionFailed
 	}
-
-	// Resolve the repo path HERE, against the caller's working directory.
-	// The daemon is a separate long-lived process with its own cwd, so a
-	// relative path sent as-is is resolved against wherever the daemon happens
-	// to have been started -- which produced "invalid git repository at \".\""
-	// for a caller sitting in a perfectly good repository.
-	repoPath := *repo
-	if abs, err := filepath.Abs(repoPath); err == nil {
-		repoPath = abs
+	if *autoPush || (*snapshot && *ref != "") || *timeoutSec <= 0 || *waitSec <= 0 || fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "Invalid submission: auto-push is disabled; snapshot and ref are exclusive; timeouts must be positive; unexpected operands are not accepted.")
+		return exitSubmissionFailed
 	}
-
-	req := core.EnqueueRequest{
-		RepoPath: repoPath,
-		Ref:      *ref,
-		Command:  cmd,
-		AutoPush: *autoPush,
-		Timeout:  time.Duration(*timeoutSec) * time.Second,
+	repoPath, err := filepath.Abs(*repo)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return exitSubmissionFailed
 	}
-
-	// Refuse before committing to a long run rather than dying part-way
-	// through it. A worktree is a full checkout, and an ENOSPC mid-gate does
-	// not surface as a disk error — the Go build cache starts evicting entries
-	// it is writing and the run fails with a toolchain error that points
-	// nowhere near the real cause.
+	var command []string
+	if strings.TrimSpace(*cmdStr) != "" {
+		command = []string{*cmdStr}
+	}
+	req := api.EnqueueRequest{RepoPath: repoPath, Ref: *ref, Snapshot: *snapshot, Command: command, Timeout: time.Duration(*timeoutSec) * time.Second, DedupeKey: *dedupeKey}
 	if warning, err := core.CheckDiskSpace(worktreeBaseDir()); err != nil {
 		fmt.Fprintf(os.Stderr, "Refusing to enqueue: %s\n", err)
-		os.Exit(1)
+		return exitSubmissionFailed
 	} else if warning != "" {
-		fmt.Fprintf(os.Stderr, "⚠️  %s\n", warning)
+		fmt.Fprintln(os.Stderr, warning)
 	}
-
-	c := client.New("")
-
-	// Try to get (or auto-start) the shared daemon so this job coordinates
-	// with everything else on the machine instead of running in isolation.
 	if err := c.EnsureDaemon(client.DefaultConcurrency()); err != nil {
-		fmt.Fprintf(os.Stderr, "ℹ️  Could not start shared daemon (%s); running standalone.\n", err)
+		if errors.Is(err, client.ErrIncompatible) {
+			fmt.Fprintln(os.Stderr, err)
+			return exitSubmissionFailed
+		}
+		fmt.Fprintf(os.Stderr, "Shared daemon unavailable (%s); running standalone to completion.\n", err)
 	}
-
-	// If daemon is running, use client
 	if c.IsDaemonRunning() {
 		job, pos, err := c.Enqueue(req)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %s\n", err)
-			os.Exit(1)
+			fmt.Fprintln(os.Stderr, err)
+			return exitSubmissionFailed
 		}
-		fmt.Printf("✅ Job enqueued to local daemon!\n")
-		fmt.Printf("   Job ID:    %s\n", job.ID)
-		fmt.Printf("   Repo:      %s\n", job.RepoPath)
-		fmt.Printf("   Ref:       %s\n", job.Ref)
-		fmt.Printf("   Position:  #%d in queue\n", pos)
-		fmt.Printf("   Worktree:  Clean & unlocked (you can keep coding)\n")
-		// Nothing here notifies a caller that walked away: the desktop
-		// notification reaches a human, and this command has already exited as
-		// far as any process watching it is concerned. Name the follow-up, so
-		// "enqueue and carry on" does not quietly become "enqueue and forget".
-		fmt.Printf("   Notify:    pushguard await %s --timeout 1500   (run it in the background)\n", job.ID)
-
-		if *wait {
-			fmt.Printf("Waiting for job to finish...\n")
-			for {
-				time.Sleep(1 * time.Second)
-				j, err := c.GetJob(job.ID)
-				if err != nil {
-					continue
-				}
-				if j.IsFinished() {
-					fmt.Printf("Result: %s (exit %d) in %s\n", strings.ToUpper(string(j.Status)), j.ExitCode, j.DurationString())
-					if j.Status != core.StatusPassed {
-						logs, _ := c.GetLogs(j.ID, 30)
-						fmt.Println("\n--- Last 30 lines of logs ---")
-						fmt.Println(logs)
-						os.Exit(j.ExitCode)
-					}
-					os.Exit(0)
-				}
-			}
+		if job.Reused {
+			fmt.Printf("Job ID: %s\nReused active verification for tested SHA: %s\n", job.ID, job.Ref)
+		} else {
+			fmt.Printf("Job ID: %s\nRepository: %s\nSource: %s\nTested SHA: %s\nRequested ref: %s\nBase SHA: %s\nPosition: %d\n", job.ID, job.RepoPath, job.SourceKind, job.Ref, job.RequestedRef, job.BaseSHA, pos)
 		}
-		return
+		fmt.Printf("Worktree: Clean & unlocked (you can keep coding)\nNotify: pushguard await %s --timeout 1500 (run in the background)\n", job.ID)
+		if !*wait {
+			return 0
+		}
+		return awaitResult(c, job.ID, time.Duration(*waitSec)*time.Second)
 	}
-
-	// Daemon is not running -> run inline with local embedded engine
-	fmt.Println("ℹ️  Daemon not detected. Running with local standalone engine...")
-	memStore := store.NewMemoryStore(100)
-	wm, err := git.NewWorktreeManager("")
+	base, err := os.MkdirTemp("", "pushguard-standalone-")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error initializing worktrees: %s\n", err)
-		os.Exit(1)
+		fmt.Fprintln(os.Stderr, err)
+		return exitSubmissionFailed
 	}
-	r, _ := runner.NewLocalRunner("")
-	n := notifier.NewMultiNotifier(notifier.NewMacOSNotifier(), &notifier.TerminalBellNotifier{})
-
-	engine := core.NewEngine(
-		core.EngineConfig{MaxConcurrent: 1, DefaultTimeout: time.Duration(*timeoutSec) * time.Second},
-		memStore, wm, r, n,
-		func(dir string) []string { return runner.DetectCommand(dir).Command },
-	)
+	wm, err := git.NewWorktreeManager(filepath.Join(base, "worktrees"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return exitSubmissionFailed
+	}
+	r, err := runner.NewLocalRunner(filepath.Join(base, "logs"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return exitSubmissionFailed
+	}
+	engine := core.NewEngine(core.EngineConfig{DefaultTimeout: time.Duration(*timeoutSec) * time.Second, Build: buildID()}, store.NewMemoryStore(100), wm, r, nil,
+		func(dir string) []string { return runner.DetectCommand(dir).Command })
 	engine.Start()
 	defer engine.Stop()
-
-	job, _, err := engine.Enqueue(req)
+	job, _, err := engine.Enqueue(core.EnqueueRequest{RepoPath: req.RepoPath, Ref: req.Ref, Command: req.Command, Name: req.Name, AutoPush: req.AutoPush, Timeout: req.Timeout, Snapshot: req.Snapshot, DedupeKey: req.DedupeKey})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
-		os.Exit(1)
+		fmt.Fprintln(os.Stderr, err)
+		return exitSubmissionFailed
 	}
+	fmt.Printf("Standalone job %s: %s %s (logs: %s)\n", job.ID, job.SourceKind, job.Ref, filepath.Join(base, "logs"))
+	// Standalone has no process to outlive us: supervise until execution finishes.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	result, err := engine.AwaitJob(ctx, job.ID, 100*time.Millisecond)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return exitJobNoVerdict
+	}
+	logs := result.TailLogs(400)
+	apiResult := application.Snapshot(result)
+	reportFinishedJob(apiResult, logs)
+	return exitCodeFor(apiResult)
+}
 
-	fmt.Printf("✅ Job %s scheduled in isolated worktree.\n", job.ID)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutSec)*time.Second)
+func awaitResult(c *client.Client, jobID string, timeout time.Duration) int {
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	ctx, cancel := context.WithTimeout(signalCtx, timeout)
 	defer cancel()
-
-	finishedJob, err := engine.AwaitJob(ctx, job.ID, 500*time.Millisecond)
+	job, err := c.Await(ctx, jobID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Wait error: %s\n", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "Await failed: %s\n", err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return exitAwaitTimeout
+		}
+		if errors.Is(err, client.ErrNoVerdict) || errors.Is(err, context.Canceled) {
+			return exitJobNoVerdict
+		}
+		return exitJobFailed
 	}
-
-	fmt.Printf("Finished: %s in %s (exit code %d)\n",
-		strings.ToUpper(string(finishedJob.Status)),
-		finishedJob.DurationString(),
-		finishedJob.ExitCode,
-	)
-
-	if finishedJob.Status != core.StatusPassed {
-		fmt.Println("\n--- Output Log Snippet ---")
-		fmt.Println(finishedJob.TailLogs(30))
-		os.Exit(exitCodeFor(finishedJob))
-	}
+	reportFinishedJob(*job, readJobLog(jobID))
+	return exitCodeFor(*job)
 }
 
 func handleStatus(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: pushguard status <job-id>")
-		os.Exit(1)
+		if !showDaemonStatus(daemonClient("")) {
+			os.Exit(1)
+		}
+		return
 	}
 	jobID := args[0]
-	c := client.New("")
+	c := daemonClient("")
 
 	if !c.IsDaemonRunning() {
 		statusFromDisk(jobID)
@@ -257,6 +255,7 @@ func handleStatus(args []string) {
 	fmt.Printf("Status:   %s\n", strings.ToUpper(string(job.Status)))
 	fmt.Printf("Repo:     %s\n", job.RepoPath)
 	fmt.Printf("Branch:   %s\n", job.Branch)
+	printProvenance(*job)
 	fmt.Printf("Command:  %s\n", strings.Join(job.Command, " "))
 	fmt.Printf("Duration: %s\n", job.DurationString())
 	if job.ExitCode != 0 {
@@ -281,6 +280,25 @@ func handleStatus(args []string) {
 	fmt.Println(tailLines(logs, 40))
 }
 
+func showDaemonStatus(c *client.Client) bool {
+	health, err := c.Health(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "PushGuard daemon is not running: %s\n", err)
+		return false
+	}
+	agreement := "yes"
+	if c.Build() != "" && c.Build() != health.Build {
+		agreement = "NO"
+	}
+	fmt.Printf("Daemon build: %s | Client build: %s | Agreement: %s\n", health.Build, c.Build(), agreement)
+	fmt.Printf("PID: %d | Uptime: %s | Queue depth: %d | Active jobs: %d | Concurrency: %d\n", health.PID, time.Duration(health.UptimeSeconds)*time.Second, health.QueueDepth, health.ActiveJobs, health.Concurrency)
+	if agreement == "NO" {
+		fmt.Fprintln(os.Stderr, "Submission is blocked until active jobs finish and the daemon is restarted.")
+		return false
+	}
+	return true
+}
+
 // tailLines returns the last n lines of s.
 func tailLines(s string, n int) string {
 	lines := strings.Split(s, "\n")
@@ -291,13 +309,20 @@ func tailLines(s string, n int) string {
 }
 
 func handleList(args []string) {
-	c := client.New("")
+	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	ref := fs.String("ref", "", "Only show jobs for this tested SHA or requested ref")
+	limit := fs.Int("limit", 30, "Maximum jobs to show")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *limit < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: pushguard list [--ref <commit-or-ref>] [--limit <count>]")
+		return
+	}
+	c := daemonClient("")
 	if !c.IsDaemonRunning() {
-		listFromDisk()
+		listFromDisk(*limit, *ref)
 		return
 	}
 
-	jobs, err := c.ListJobs(30)
+	jobs, err := c.ListJobsByRef(*limit, *ref)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
 		os.Exit(1)
@@ -311,14 +336,14 @@ func handleList(args []string) {
 	// Ordered running → queued (in the order they will run) → finished, because
 	// the questions a second agent actually has are "what is running", "what is
 	// ahead of mine", and only then "what happened recently".
-	core.SortForQueueView(jobs)
+	application.SortForQueueView(jobs)
 	renderJobTable(jobs)
 }
 
 // renderJobTable prints the queue view. Split out of handleList so the
 // offline path below renders identically -- a second table that drifted from
 // this one would be worse than no offline listing at all.
-func renderJobTable(jobs []*core.Job) {
+func renderJobTable(jobs []api.Job) {
 	fmt.Printf("%-14s %-10s %-4s %-10s %-24s %-10s %s\n", "JOB ID", "STATUS", "POS", "REF", "REPOSITORY", "DURATION", "COMMAND")
 	fmt.Println(strings.Repeat("-", 108))
 	position := 0
@@ -326,7 +351,7 @@ func renderJobTable(jobs []*core.Job) {
 		// Position is only meaningful for work that has not started. A number
 		// beside a finished job would read as history rather than a queue.
 		pos := "-"
-		if j.Status == core.StatusQueued {
+		if j.Status == api.StatusQueued {
 			position++
 			pos = fmt.Sprintf("%d", position)
 		}
@@ -342,19 +367,8 @@ func renderJobTable(jobs []*core.Job) {
 	}
 }
 
-// shortRef is the commit a job is actually testing.
-//
-// Job.Ref is that commit: the ref the caller asked for, or the resolved HEAD or
-// working-tree snapshot when they asked for neither. Job.CommitSHA is something
-// else entirely — the branch tip at the moment of enqueue, recorded regardless
-// of --ref.
-//
-// Preferring CommitSHA, as this first did, reports the tip for a job that is
-// deliberately gating an older SHA. That is the dangerous direction: it tells
-// you a release gate covered the tip when it covered a commit from before the
-// fix you are relying on. Caught when a peer enqueued --ref d7ab0d01a, saw the
-// enqueue echo it back correctly, and then saw this column claim 635ee5063.
-func shortRef(j *core.Job) string {
+// shortRef prefers the tested ref. Legacy records may only carry CommitSHA.
+func shortRef(j api.Job) string {
 	ref := strings.TrimSpace(j.Ref)
 	if ref == "" {
 		ref = strings.TrimSpace(j.CommitSHA)
@@ -389,89 +403,18 @@ func splitPositional(args []string) (string, []string) {
 }
 
 func handleAwait(args []string) {
-	// Split the job id out BEFORE parsing flags.
-	//
-	// Go's flag package stops at the first non-flag argument, so
-	// `await <job-id> --timeout 2400` parsed nothing and silently used the
-	// default — which is the order this command's own usage string documents,
-	// and it cost a 900-second wait that reported a timeout on a job that was
-	// merely queued behind others.
-	//
-	// Accepting either order is the fix; a positional-then-flag command line is
-	// what anyone would type.
 	jobID, flags := splitPositional(args)
 	fs := flag.NewFlagSet("await", flag.ExitOnError)
-	timeoutSec := fs.Int("timeout", 900, "Seconds to wait before giving up")
+	timeoutSec := fs.Int("timeout", 1500, "Seconds to wait before giving up")
 	_ = fs.Parse(flags)
 	if jobID == "" {
-		// Flags came first, so the parser reached the operand itself.
 		jobID = fs.Arg(0)
 	}
-	if jobID == "" {
-		fmt.Fprintln(os.Stderr, "Usage: pushguard await <job-id> [--timeout <seconds>]")
+	if jobID == "" || *timeoutSec <= 0 {
+		fmt.Fprintln(os.Stderr, "Usage: pushguard await <job-id> [--timeout <positive seconds>]")
 		os.Exit(1)
 	}
-
-	c := client.New("")
-	if !c.IsDaemonRunning() {
-		// Refusing at the door was wrong whenever the answer is already on
-		// disk: the daemon idles out thirty minutes after the queue empties,
-		// which is routinely AFTER the job being waited on finished. status
-		// and list both read the mirrored record; await refused, which made
-		// "the daemon went away" look like "your result is gone".
-		//
-		// A job still recorded as queued or running is a different matter --
-		// no daemon means nothing is going to advance it, so waiting would
-		// hang until the timeout for an answer that can never come.
-		stored, err := store.OpenReadOnly().Get(jobID)
-		if err != nil || !stored.IsFinished() {
-			fmt.Fprintln(os.Stderr, "PushGuard daemon is not running.")
-			if err == nil {
-				fmt.Fprintf(os.Stderr, "Job %s is recorded as %s and nothing is running it. Re-enqueue it.\n", jobID, stored.Status)
-				os.Exit(exitJobNoVerdict)
-			}
-			os.Exit(1)
-		}
-		reportFinishedJob(stored, readJobLog(jobID))
-		if stored.Status != core.StatusPassed {
-			os.Exit(exitCodeFor(stored))
-		}
-		return
-	}
-
-	deadline := time.Now().Add(time.Duration(*timeoutSec) * time.Second)
-	for {
-		job, err := c.GetJob(jobID)
-		if err != nil {
-			// The daemon can go away mid-wait (idle shutdown racing the last
-			// job, a crash, someone rebuilding). Its last mirrored record is
-			// still on disk and may well be the finished verdict we are here
-			// for, so read that before giving up.
-			if stored, storeErr := store.OpenReadOnly().Get(jobID); storeErr == nil && stored.IsFinished() {
-				job = stored
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", err)
-				// Not a failed gate: nothing was decided. Exiting 1 here would
-				// be indistinguishable from a red run.
-				os.Exit(exitJobNoVerdict)
-			}
-		}
-		if job.IsFinished() {
-			logs, _ := c.GetLogs(jobID, 400)
-			reportFinishedJob(job, logs)
-			// Exit non-zero on a red job so a shell caller can branch on it,
-			// and give "no verdict" its own code so it cannot read as either.
-			if job.Status != core.StatusPassed {
-				os.Exit(exitCodeFor(job))
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			fmt.Fprintf(os.Stderr, "Timed out after %ds; job %s is still %s.\n", *timeoutSec, jobID, job.Status)
-			os.Exit(exitAwaitTimeout)
-		}
-		time.Sleep(5 * time.Second)
-	}
+	os.Exit(awaitResult(daemonClient(""), jobID, time.Duration(*timeoutSec)*time.Second))
 }
 
 func handleCancel(args []string) {
@@ -480,7 +423,7 @@ func handleCancel(args []string) {
 		os.Exit(1)
 	}
 	jobID := args[0]
-	c := client.New("")
+	c := daemonClient("")
 
 	if !c.IsDaemonRunning() {
 		fmt.Fprintln(os.Stderr, "PushGuard daemon is not running.")
@@ -495,7 +438,7 @@ func handleCancel(args []string) {
 }
 
 func handleClean() {
-	c := client.New("")
+	c := daemonClient("")
 	if c.IsDaemonRunning() {
 		report, err := c.Clean()
 		if err != nil {
@@ -510,9 +453,27 @@ func handleClean() {
 		return
 	}
 
-	// Standalone clean
-	wm, _ := git.NewWorktreeManager("")
-	r, _ := runner.NewLocalRunner("")
+	// Standalone cleanup must own shared state before touching artifacts.
+	ownership, err := daemon.AcquireOwnership(filepath.Dir(daemonJobDir()))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot clean daemon state: %s\n", err)
+		os.Exit(1)
+	}
+	defer ownership.Close()
+	if err := daemon.AssertSocketAvailable(daemon.DefaultSocketPath()); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot clean daemon state: %s\n", err)
+		os.Exit(1)
+	}
+	wm, err := git.NewWorktreeManager("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize worktrees: %s\n", err)
+		os.Exit(1)
+	}
+	r, err := runner.NewLocalRunner("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize logs: %s\n", err)
+		return
+	}
 	memStore := store.NewMemoryStore(100)
 	engine := core.NewEngine(core.EngineConfig{MaxConcurrent: 1}, memStore, wm, r, nil, nil)
 	report := engine.Clean()
@@ -529,6 +490,9 @@ func handleClean() {
 // worktreeBaseDir is where worktrees are created, and so the filesystem whose
 // free space actually matters. Mirrors git.NewWorktreeManager's default.
 func worktreeBaseDir() string {
+	if base := os.Getenv("PUSHGUARD_STATE_DIR"); base != "" {
+		return filepath.Join(base, "worktrees")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return os.TempDir()
@@ -549,8 +513,10 @@ func defaultRedisAddr() string {
 	return "127.0.0.1:6379"
 }
 
-func handleDaemon(args []string) {
-	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+func handleDaemon(args []string) { os.Exit(runDaemon(args)) }
+
+func runDaemon(args []string) int {
+	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	socketPath := fs.String("socket", daemon.DefaultSocketPath(), "Path to Unix socket")
 	httpAddr := fs.String("http", "", "Optional HTTP address to bind (e.g. 127.0.0.1:8942)")
 	// Default from PUSHGUARD_CONCURRENCY so the value survives the daemon's
@@ -559,12 +525,28 @@ func handleDaemon(args []string) {
 	concurrency := fs.Int("concurrency", client.DefaultConcurrency(), "Max concurrent test workers (default from PUSHGUARD_CONCURRENCY)")
 	idleMinutes := fs.Int("idle-shutdown-minutes", 30, "Self-shutdown after this many idle minutes with no jobs (0 disables)")
 	redisAddr := fs.String("redis-addr", defaultRedisAddr(), "Redis address for job-event pub/sub (empty disables); overridable via PUSHGUARD_REDIS_ADDR")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *concurrency <= 0 || *idleMinutes < 0 {
+		fmt.Fprintln(os.Stderr, "Invalid daemon concurrency/idle timeout")
+		return 1
+	}
 	idleShutdown := time.Duration(*idleMinutes) * time.Minute
 
 	// Mirror jobs to disk. The daemon is long-lived and callers are encouraged
 	// to enqueue and walk away, so a restart that erased every queued and
 	// running job would be invisible to exactly the people relying on it.
+	ownership, err := daemon.AcquireOwnership(filepath.Dir(daemonJobDir()))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot own daemon state: %s\n", err)
+		return 1
+	}
+	defer ownership.Close()
+	if err := daemon.AssertSocketAvailable(*socketPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot recover daemon state: %s\n", err)
+		return 1
+	}
 	jobStore := store.NewDurable(store.NewMemoryStore(200), daemonJobDir())
 	orphans := jobStore.RecoverOrphans()
 
@@ -572,7 +554,7 @@ func handleDaemon(args []string) {
 	wm, err := git.NewWorktreeManager("")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize worktrees: %s\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// An interrupted job also leaves its worktree behind, and the age-based
@@ -598,10 +580,16 @@ func handleDaemon(args []string) {
 			worktreeDir = filepath.Join(wm.BaseDir, orphan.ID)
 		}
 		if orphan.RepoPath != "" {
-			_ = wm.RemoveWorktree(orphan.RepoPath, worktreeDir)
+			if err := wm.RemoveWorktree(orphan.RepoPath, worktreeDir); err != nil {
+				fmt.Fprintf(os.Stderr, "Orphan cleanup: %s\n", err)
+			}
 		}
 	}
-	r, _ := runner.NewLocalRunner("")
+	r, err := runner.NewLocalRunner("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize logs: %s\n", err)
+		return 1
+	}
 	notifiers := []notifier.Notifier{notifier.NewMacOSNotifier(), &notifier.TerminalBellNotifier{}}
 	if *redisAddr != "" {
 		if rn, err := notifier.NewRedisNotifier(*redisAddr, ""); err != nil {
@@ -618,20 +606,24 @@ func handleDaemon(args []string) {
 		core.EngineConfig{
 			MaxConcurrent:  *concurrency,
 			DefaultTimeout: 15 * time.Minute,
+			Build:          buildID(),
 		},
 		memStore, wm, r, n,
 		func(dir string) []string { return runner.DetectCommand(dir).Command },
 	)
 
-	server := daemon.NewServer(engine, daemon.Config{
-		SocketPath: *socketPath,
-		HTTPAddr:   *httpAddr,
+	server := daemon.NewServer(application.NewEngineService(engine), daemon.Config{
+		SocketPath:  *socketPath,
+		HTTPAddr:    *httpAddr,
+		Build:       buildID(),
+		Concurrency: *concurrency,
 	})
 
 	engine.Start()
+	defer engine.Stop()
 	if err := server.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start daemon: %s\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	fmt.Printf("🚀 PushGuard daemon running (workers=%d)\n", *concurrency)
@@ -648,13 +640,17 @@ func handleDaemon(args []string) {
 	// Wait for terminate signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
+	var maintenance sync.WaitGroup
 
 	// Self-shutdown when idle: a daemon nobody is using should not sit
 	// around forever on a personal machine. It cleans up after itself
 	// (same sweep as `pushguard clean`) right before exiting, and the next
 	// enqueue call simply respawns it.
 	idleDone := make(chan struct{})
+	maintenance.Add(1)
 	go func() {
+		defer maintenance.Done()
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -665,12 +661,15 @@ func handleDaemon(args []string) {
 				if idleShutdown <= 0 {
 					continue
 				}
-				if engine.ActiveJobCount() == 0 && engine.IdleDuration() >= idleShutdown {
+				if engine.TryDrainIdle(idleShutdown) {
 					report := engine.Clean()
 					fmt.Printf("\n[pushguard] idle for %s with no jobs — cleaning up and shutting down "+
 						"(jobs flushed=%d, worktrees pruned=%d, logs pruned=%d)\n",
 						idleShutdown, report.JobsFlushed, report.WorktreesPruned, report.LogsPruned)
-					sigChan <- syscall.SIGTERM
+					select {
+					case sigChan <- syscall.SIGTERM:
+					default:
+					}
 					return
 				}
 			}
@@ -684,7 +683,9 @@ func handleDaemon(args []string) {
 	// touches disk state (not the in-memory job store), so it never makes a
 	// still-relevant job disappear from pushguard_list/status.
 	diskPruneDone := make(chan struct{})
+	maintenance.Add(1)
 	go func() {
+		defer maintenance.Done()
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 		for {
@@ -708,76 +709,24 @@ func handleDaemon(args []string) {
 	<-sigChan
 	close(idleDone)
 	close(diskPruneDone)
+	maintenance.Wait()
 
 	fmt.Println("\nShutting down PushGuard daemon...")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_ = server.Stop(ctx)
-
-	// Cancel in-flight work BEFORE stopping, or this never returns.
-	//
-	// Engine.Stop() is wg.Wait(): it waits for the worker loops, and a worker
-	// running an ~8 minute pre-push gate will hold it for the full ~8 minutes.
-	// So `pkill pushguard daemon` did not stop the daemon at all — it left it
-	// hanging until the job it was already running finished, which looks
-	// exactly like a daemon that ignored the signal.
-	//
-	// Cancelling first kills the job processes, the workers return, and Stop()
-	// completes promptly.
-	inFlight := []*core.Job{}
-	for _, job := range jobStore.List(0) {
-		if job != nil && !job.IsFinished() {
-			inFlight = append(inFlight, job)
-			_ = engine.Cancel(job.ID)
-		}
-	}
-	if len(inFlight) > 0 {
-		fmt.Printf("Cancelling %d in-flight job(s)...\n", len(inFlight))
+	if err := server.Stop(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Listener shutdown: %s\n", err)
 	}
 
-	// Only now is it safe to touch a worktree: deleting a directory out from
-	// under a running compiler produces a failure that looks like a code error
-	// and is not.
 	engine.Stop()
 
-	// Reclaim what the interrupted jobs were using.
-	//
-	// The idle-shutdown path already cleaned up on its way out; a signal did
-	// not, so `pkill pushguard daemon` left every worktree behind for the
-	// age-based sweep to find an hour later — and a large monorepo's worktree
-	// can easily be several hundred MB, so a few interrupted runs fill a
-	// disk. The resulting ENOSPC then surfaces as unrelated build failures in
-	// whatever runs next, which is a genuinely confusing thing to debug.
-	//
-	// This is the graceful half. It cannot be the whole answer: SIGKILL runs no
-	// code at all, so RecoverOrphans at startup stays as the backstop. Belt and
-	// braces on purpose — the two cover different failures.
-	reclaimed := 0
-	for _, job := range inFlight {
-		// Cancel already moved these to cancelled; restate WHY, because
-		// "cancelled" alone reads as somebody having cancelled it on purpose.
-		job.MarkInterrupted("daemon shut down while this job was in flight; it did not run to completion — re-enqueue it", time.Now())
-		_ = jobStore.Update(job)
-
-		worktreeDir := job.WorktreeDir
-		if worktreeDir == "" {
-			worktreeDir = filepath.Join(wm.BaseDir, job.ID)
-		}
-		if job.RepoPath != "" {
-			_ = wm.RemoveWorktree(job.RepoPath, worktreeDir)
-			reclaimed++
-		}
-	}
-	if reclaimed > 0 {
-		fmt.Printf("Reclaimed %d worktree(s) from interrupted job(s); re-enqueue them.\n", reclaimed)
-	}
-
 	fmt.Println("Daemon stopped cleanly.")
+	return 0
 }
 
 func handleMCP() {
-	server := mcp.NewServer()
+	server := mcp.NewServer(buildID())
 	if err := server.Serve(os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server error: %s\n", err)
 		os.Exit(1)
@@ -791,7 +740,7 @@ func handleHook(args []string) {
 	}
 	fs := flag.NewFlagSet("hook install", flag.ExitOnError)
 	repo := fs.String("repo", ".", "Repository root")
-	async := fs.Bool("async", false, "Use async mode with auto-push")
+	async := fs.Bool("async", false, "Disabled: asynchronous hook installation is unavailable")
 	_ = fs.Parse(args[1:])
 
 	hookPath, err := hook.InstallPrePushHook(*repo, *async)
@@ -801,11 +750,7 @@ func handleHook(args []string) {
 	}
 
 	fmt.Printf("✅ Pre-push hook installed at: %s\n", hookPath)
-	if *async {
-		fmt.Println("   Mode: ASYNC (Pre-push pushes automatically when isolated tests pass)")
-	} else {
-		fmt.Println("   Mode: SYNC (Runs in isolated worktree without locking your main files)")
-	}
+	fmt.Println("   Mode: SYNC (verifies the pushed commit SHAs in isolated worktrees)")
 }
 
 func truncate(s string, max int) string {
@@ -858,7 +803,9 @@ func statusFromDisk(jobID string) {
 	fmt.Printf("Status:   %s\n", strings.ToUpper(string(job.Status)))
 	fmt.Printf("Repo:     %s\n", job.RepoPath)
 	fmt.Printf("Branch:   %s\n", job.Branch)
-	fmt.Printf("Ref:      %s\n", shortRef(job))
+	publicJob := application.Snapshot(job)
+	printProvenance(publicJob)
+	fmt.Printf("Ref:      %s\n", shortRef(publicJob))
 	fmt.Printf("Command:  %s\n", strings.Join(job.Command, " "))
 	fmt.Printf("Duration: %s\n", job.DurationString())
 	if job.ExitCode != 0 {
@@ -885,6 +832,9 @@ func statusFromDisk(jobID string) {
 // construction, and a read-only status call must not.
 func readJobLog(jobID string) string {
 	base := os.Getenv("PUSHGUARD_LOG_DIR")
+	if base == "" && os.Getenv("PUSHGUARD_STATE_DIR") != "" {
+		base = filepath.Join(os.Getenv("PUSHGUARD_STATE_DIR"), "logs")
+	}
 	if base == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -904,8 +854,20 @@ func readJobLog(jobID string) string {
 // An empty directory still exits 1: with nothing to show and no daemon, "the
 // daemon is down" is the only true answer, and printing an empty table would
 // claim the queue is empty when it is merely unreadable.
-func listFromDisk() {
-	jobs := offlineStore().ListFromDisk(30)
+func listFromDisk(limit int, ref string) {
+	jobs := offlineStore().ListFromDisk(0)
+	if ref != "" {
+		filtered := jobs[:0]
+		for _, job := range jobs {
+			if job.Ref == ref || job.CommitSHA == ref || job.RequestedRef == ref || job.BaseSHA == ref {
+				filtered = append(filtered, job)
+			}
+		}
+		jobs = filtered
+	}
+	if len(jobs) > limit {
+		jobs = jobs[:limit]
+	}
 	if len(jobs) == 0 {
 		fmt.Fprintln(os.Stderr, "PushGuard daemon is not running, and no stored job records were found.")
 		fmt.Fprintln(os.Stderr, "Start it with `pushguard daemon` (or `make pushguard-start`).")
@@ -913,8 +875,12 @@ func listFromDisk() {
 	}
 	offlineBanner()
 	fmt.Println()
-	core.SortForQueueView(jobs)
-	renderJobTable(jobs)
+	publicJobs := make([]api.Job, 0, len(jobs))
+	for _, job := range jobs {
+		publicJobs = append(publicJobs, application.Snapshot(job))
+	}
+	application.SortForQueueView(publicJobs)
+	renderJobTable(publicJobs)
 }
 
 // Exit codes for a finished job. Only a gate that actually passed exits 0.
@@ -922,7 +888,7 @@ func listFromDisk() {
 //	0  passed
 //	1  failed — the checks ran and something was red
 //	2  timed out waiting (await only; the job may still be running)
-//	3  no verdict — cancelled, or orphaned by a daemon restart. Nothing ran.
+//	3  no verdict — cancelled, or interrupted before completion.
 //
 // The third code is the point. A cancelled job records ExitCode 0 for the
 // mundane reason that no process ever returned one, and both `enqueue --wait`
@@ -942,11 +908,11 @@ const (
 	exitJobNoVerdict = 3
 )
 
-func exitCodeFor(job *core.Job) int {
+func exitCodeFor(job api.Job) int {
 	switch job.Status {
-	case core.StatusPassed:
+	case api.StatusPassed:
 		return 0
-	case core.StatusCancelled:
+	case api.StatusCancelled:
 		return exitJobNoVerdict
 	default:
 		return exitJobFailed
@@ -966,7 +932,8 @@ func exitCodeFor(job *core.Job) int {
 //
 // A terminal verdict line means a tailed, truncated or piped read still ends on
 // the answer. One line, and it closes the gap the exit code alone could not.
-func reportFinishedJob(job *core.Job, logs string) {
+func reportFinishedJob(job api.Job, logs string) {
+	printProvenance(job)
 	fmt.Printf("%s (exit %d) in %s\n", strings.ToUpper(string(job.Status)), job.ExitCode, job.DurationString())
 	if logs != "" {
 		if failure := core.ExtractFailure(logs, 30); failure != "" {
@@ -976,4 +943,12 @@ func reportFinishedJob(job *core.Job, logs string) {
 	}
 	fmt.Printf("\n=== GATE %s === job %s exited %d\n",
 		strings.ToUpper(string(job.Status)), job.ID, exitCodeFor(job))
+}
+
+func printProvenance(job api.Job) {
+	kind := job.SourceKind
+	if kind == "" {
+		kind = "legacy (provenance not recorded)"
+	}
+	fmt.Printf("Tested ref: %s | source: %s | requested ref: %s | base SHA: %s\n", job.Ref, kind, job.RequestedRef, job.BaseSHA)
 }

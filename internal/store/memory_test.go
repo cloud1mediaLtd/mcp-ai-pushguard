@@ -40,8 +40,8 @@ func TestMemoryStore_CRUD(t *testing.T) {
 	job4 := &core.Job{ID: "job4", Status: core.StatusQueued}
 	_ = s.Save(job4)
 
-	if _, err := s.Get("job1"); err != ErrJobNotFound {
-		t.Fatalf("expected oldest job1 to be evicted")
+	if _, err := s.Get("job1"); err != nil {
+		t.Fatalf("active oldest job1 must survive capacity: %v", err)
 	}
 }
 
@@ -57,4 +57,28 @@ func TestMemoryStore_NotFound(t *testing.T) {
 		t.Fatalf("expected ErrJobNotFound on update, got %v", err)
 	}
 	fmt.Println("NotFound tests passed")
+}
+
+func TestMemoryStoreCapacityRetainsEveryActiveJob(t *testing.T) {
+	s := NewMemoryStore(1)
+	active := queuedJob("pg_active")
+	if err := s.Save(active); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"pg_done1", "pg_done2"} {
+		done := queuedJob(id)
+		done.Status = core.StatusPassed
+		if err := s.Save(done); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := s.Get(active.ID); err != nil || got != active {
+		t.Fatalf("lost live job identity: %p %v", got, err)
+	}
+	if _, err := s.Get("pg_done1"); err != ErrJobNotFound {
+		t.Fatal("old completed history was not evicted")
+	}
+	if got := len(s.List(0)); got != 2 {
+		t.Fatalf("expected active plus one history record, got %d", got)
+	}
 }

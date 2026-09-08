@@ -1,6 +1,8 @@
 package store
 
 import (
+	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -201,4 +203,92 @@ func contains(haystack, needle string) bool {
 			}
 			return false
 		}())
+}
+
+func TestDurableStoreRejectsUnwritableAdmission(t *testing.T) {
+	// A regular file is deterministically unusable as a job directory, including as root.
+	dir := t.TempDir() + "/not-a-directory"
+	if err := os.WriteFile(dir, []byte("occupied"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	inner := NewMemoryStore(1)
+	s := NewDurable(inner, dir)
+	job := queuedJob("pg_rejected")
+	if err := s.Save(job); err == nil {
+		t.Fatal("durability failure reported success")
+	}
+	if _, err := inner.Get(job.ID); err != ErrJobNotFound {
+		t.Fatal("failed admission leaked into memory")
+	}
+}
+
+func TestDurableStorePersistsEvictedTerminalUpdate(t *testing.T) {
+	dir := t.TempDir()
+	s := NewDurable(NewMemoryStore(1), dir)
+	job := queuedJob("pg_history")
+	job.Status = core.StatusPassed
+	if err := s.Save(job); err != nil {
+		t.Fatal(err)
+	}
+	s.Clear(true)
+	job.Error = "updated history"
+	if err := s.Update(job); err != nil {
+		t.Fatal(err)
+	}
+	disk, err := s.readFromDisk(job.ID)
+	if err != nil || disk.Error != job.Error {
+		t.Fatalf("evicted update lost: %+v %v", disk, err)
+	}
+}
+
+func TestDurableStoreConcurrentUpdatesPreserveCurrentState(t *testing.T) {
+	s := NewDurable(NewMemoryStore(1), t.TempDir())
+	job := queuedJob("pg_concurrent")
+	if err := s.Save(job); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 30 {
+				if err := s.Update(job); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	job.MarkOrphaned("cancelled", time.Now())
+	if err := s.Update(job); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	disk, err := s.readFromDisk(job.ID)
+	if err != nil || disk.Status != core.StatusCancelled {
+		t.Fatalf("persisted stale state: %+v %v", disk, err)
+	}
+}
+
+func TestDurableStoreListMergesRestartedHistoryAndLiveState(t *testing.T) {
+	dir := t.TempDir()
+	first := NewDurable(NewMemoryStore(1), dir)
+	previous := queuedJob("pg_previous")
+	previous.Status = core.StatusPassed
+	if err := first.Save(previous); err != nil {
+		t.Fatal(err)
+	}
+	second := NewDurable(NewMemoryStore(1), dir)
+	live := queuedJob("pg_live")
+	if err := second.Save(live); err != nil {
+		t.Fatal(err)
+	}
+	jobs := second.List(0)
+	if len(jobs) != 2 || jobs[0] != live || jobs[1].ID != previous.ID {
+		t.Fatalf("history/live merge: %+v", jobs)
+	}
+	if got := len(second.List(1)); got != 1 {
+		t.Fatalf("limit ignored: %d", got)
+	}
 }

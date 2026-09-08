@@ -2,6 +2,8 @@ package store
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,9 +33,8 @@ type DurableStore struct {
 	mu    sync.Mutex
 }
 
-// NewDurable wraps inner, mirroring jobs into dir. A dir that cannot be created
-// degrades to the in-memory store alone rather than failing to start: losing
-// history is bad, refusing to run any checks is worse.
+// NewDurable wraps inner, mirroring jobs into dir. Save and Update report
+// directory and write failures so callers cannot acknowledge undurable work.
 func NewDurable(inner Store, dir string) *DurableStore {
 	if dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
@@ -50,44 +51,78 @@ func (s *DurableStore) path(id string) string {
 	return filepath.Join(s.dir, id+".json")
 }
 
-func (s *DurableStore) persist(job *core.Job) {
-	if s.dir == "" || job == nil {
-		return
+func (s *DurableStore) persist(job *core.Job) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.persistLocked(job)
+}
+
+func (s *DurableStore) persistLocked(job *core.Job) error {
+	if s.dir == "" {
+		return fmt.Errorf("durable job directory is unavailable")
+	}
+	if job == nil {
+		return fmt.Errorf("cannot persist nil job")
 	}
 	path := s.path(job.ID)
 	if path == "" {
-		return
+		return fmt.Errorf("invalid job id %q", job.ID)
 	}
 	data, err := json.Marshal(job)
 	if err != nil {
-		return
+		return fmt.Errorf("encode job record: %w", err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// Write-then-rename so a reader never sees a half-written record.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return
+	file, err := os.CreateTemp(s.dir, ".job-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create job record: %w", err)
+	}
+	tmp := file.Name()
+	defer os.Remove(tmp)
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return fmt.Errorf("write job record: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close job record: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+		return fmt.Errorf("publish job record: %w", err)
 	}
+	return nil
 }
 
 func (s *DurableStore) Save(job *core.Job) error {
-	if err := s.inner.Save(job); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.inner.Get(job.ID); err == nil {
+		return fmt.Errorf("job %s already exists", job.ID)
+	}
+	if err := s.persistLocked(job); err != nil {
 		return err
 	}
-	s.persist(job)
-	return nil
+	return s.inner.Save(job)
 }
 
 func (s *DurableStore) Update(job *core.Job) error {
-	if err := s.inner.Update(job); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if job == nil {
+		return fmt.Errorf("cannot update nil job")
+	}
+	if _, err := s.inner.Get(job.ID); err != nil {
+		if _, err := s.readFromDisk(job.ID); err != nil {
+			return ErrJobNotFound
+		}
+	}
+	if err := s.persistLocked(job); err != nil {
 		return err
 	}
-	s.persist(job)
-	return nil
+	// History may have been explicitly cleared while a terminal notification
+	// finishes. Disk remains authoritative even when memory has evicted it.
+	if _, err := s.inner.Get(job.ID); err != nil {
+		return nil
+	}
+	return s.inner.Update(job)
 }
 
 // Get falls through to disk when memory does not have the job, so a job from
@@ -119,8 +154,24 @@ func (s *DurableStore) readFromDisk(id string) (*core.Job, error) {
 	return &job, nil
 }
 
-func (s *DurableStore) List(limit int) []*core.Job { return s.inner.List(limit) }
-func (s *DurableStore) Stats() MemoryStats         { return s.inner.Stats() }
+func (s *DurableStore) List(limit int) []*core.Job {
+	jobs := s.inner.List(0)
+	seen := make(map[string]bool, len(jobs))
+	for _, job := range jobs {
+		seen[job.ID] = true
+	}
+	for _, job := range s.ListFromDisk(0) {
+		if !seen[job.ID] {
+			jobs = append(jobs, job)
+		}
+	}
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.After(jobs[j].CreatedAt) })
+	if limit > 0 && len(jobs) > limit {
+		jobs = jobs[:limit]
+	}
+	return jobs
+}
+func (s *DurableStore) Stats() MemoryStats { return s.inner.Stats() }
 
 // Clear evicts from memory only, delegating to the inner store.
 //
@@ -222,7 +273,10 @@ func (s *DurableStore) RecoverOrphans() []*core.Job {
 			// to just skip rather than persist a stale snapshot either way.
 			continue
 		}
-		s.persist(job)
+		if err := s.persist(job); err != nil {
+			slog.Error("persist recovered job", "job_id", job.ID, "error", err)
+			continue
+		}
 		orphans = append(orphans, job)
 	}
 	sort.Slice(orphans, func(i, j int) bool { return orphans[i].CreatedAt.Before(orphans[j].CreatedAt) })
@@ -277,6 +331,9 @@ func (s *DurableStore) ListFromDisk(limit int) []*core.Job {
 // where the records are is exactly how one of them ends up confidently
 // reporting an empty queue.
 func DefaultJobDir() string {
+	if stateDir := os.Getenv("PUSHGUARD_STATE_DIR"); stateDir != "" {
+		return filepath.Join(stateDir, "jobs")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""

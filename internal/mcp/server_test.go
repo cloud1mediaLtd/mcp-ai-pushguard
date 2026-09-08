@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,11 +17,13 @@ import (
 	"github.com/pushguard/pushguard/internal/core"
 	"github.com/pushguard/pushguard/internal/daemon"
 	"github.com/pushguard/pushguard/internal/store"
+	"github.com/pushguard/pushguard/internal/verification/application"
+	"github.com/pushguard/pushguard/pkg/api"
 	"github.com/pushguard/pushguard/pkg/client"
 )
 
 func TestMCPServer_Lifecycle(t *testing.T) {
-	server := NewServer()
+	server := newServerWithClient(client.New(filepath.Join(t.TempDir(), "absent.sock")))
 
 	// 1. Initialize
 	input := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n"
@@ -92,7 +96,7 @@ func TestMCPServer_SurvivesDaemonDisappearingMidSession(t *testing.T) {
 
 	memStore := store.NewMemoryStore(10)
 	engine := core.NewEngine(core.EngineConfig{MaxConcurrent: 1}, memStore, nil, nil, nil, nil)
-	daemonServer := daemon.NewServer(engine, daemon.Config{SocketPath: socketPath})
+	daemonServer := daemon.NewServer(application.NewEngineService(engine), daemon.Config{SocketPath: socketPath})
 	if err := daemonServer.Start(); err != nil {
 		t.Fatalf("failed to start test daemon: %v", err)
 	}
@@ -276,5 +280,92 @@ func TestMCPServer_StatusStillErrorsForUnknownJobWithDaemonDown(t *testing.T) {
 
 	if isErr, _ := result["isError"].(bool); !isErr {
 		t.Fatalf("expected an error result for an unknown job, got %v", result)
+	}
+}
+
+func TestAwaitHonorsContextDeadline(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pg-await-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	mem := store.NewMemoryStore(10)
+	if err := mem.Save(&core.Job{ID: "pg_waiting", Status: core.StatusRunning}); err != nil {
+		t.Fatal(err)
+	}
+	engine := core.NewEngine(core.EngineConfig{}, mem, nil, nil, nil, nil)
+	srv := daemon.NewServer(application.NewEngineService(engine), daemon.Config{SocketPath: filepath.Join(dir, "s")})
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop(context.Background())
+	server := &Server{client: client.New(filepath.Join(dir, "s"))}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = server.await(ctx, "pg_waiting")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("deadline did not bound await")
+	}
+}
+
+func TestEmbeddedJobRemainsOwnedAfterDaemonRecovery(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pg-owner-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	localStore := store.NewMemoryStore(10)
+	local := core.NewEngine(core.EngineConfig{}, localStore, nil, nil, nil, nil)
+	job, _, err := local.Enqueue(core.EnqueueRequest{RepoPath: initTempGitRepoForMCPTest(t), Command: []string{"true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Stop()
+
+	remote := core.NewEngine(core.EngineConfig{}, store.NewMemoryStore(10), nil, nil, nil, nil)
+	srv := daemon.NewServer(application.NewEngineService(remote), daemon.Config{SocketPath: filepath.Join(dir, "s")})
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop(context.Background())
+	server := &Server{client: client.New(filepath.Join(dir, "s")), engine: local}
+	for _, tool := range []string{"status", "list", "cancel"} {
+		var out bytes.Buffer
+		args := map[string]any{"job_id": job.ID}
+		switch tool {
+		case "status":
+			server.toolStatus(&out, 1, args)
+		case "list":
+			server.toolList(&out, 1, args)
+		case "cancel":
+			server.toolCancel(&out, 1, args)
+		}
+		var resp JSONRPCResponse
+		if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &resp); err != nil {
+			t.Fatal(err)
+		}
+		result := resp.Result.(map[string]any)
+		if result["isError"] == true {
+			t.Fatalf("%s: %s", tool, out.String())
+		}
+		if !strings.Contains(out.String(), job.ID) {
+			t.Fatalf("%s omitted local job", tool)
+		}
+	}
+	result, err := server.await(context.Background(), job.ID)
+	if err != nil || result.Status != api.StatusCancelled {
+		t.Fatalf("local await: %v %v", result, err)
+	}
+}
+
+func TestSecondsArgumentRejectsInvalidValues(t *testing.T) {
+	for _, value := range []any{float64(0), float64(-1), 1.5, "10", math.Inf(1)} {
+		if _, err := secondsArgument(map[string]any{"timeout_seconds": value}, "timeout_seconds", 900); err == nil {
+			t.Fatalf("accepted %v", value)
+		}
 	}
 }

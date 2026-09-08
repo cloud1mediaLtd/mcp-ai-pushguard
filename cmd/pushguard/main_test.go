@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/pushguard/pushguard/internal/core"
+	"github.com/pushguard/pushguard/pkg/api"
 )
 
 // main() calls os.Exit() throughout, which makes it untestable in-process —
@@ -101,13 +102,13 @@ func TestCLI_UnknownCommand(t *testing.T) {
 	}
 }
 
-func TestCLI_StatusRequiresJobID(t *testing.T) {
+func TestCLI_StatusWithoutJobIDReportsDaemonState(t *testing.T) {
 	_, stderr, code := run(t, "status")
 	if code != 1 {
 		t.Fatalf("expected exit 1, got %d", code)
 	}
-	if !strings.Contains(stderr, "Usage: pushguard status") {
-		t.Fatalf("expected a usage message, got %q", stderr)
+	if !strings.Contains(stderr, "daemon is not running") {
+		t.Fatalf("expected daemon diagnostic, got %q", stderr)
 	}
 }
 
@@ -189,6 +190,10 @@ func runInHome(t *testing.T, home string, args ...string) (stdout, stderr string
 // on-disk shape the CLI has to read rather than agreeing with the writer by
 // construction.
 func seedJobRecord(t *testing.T, home, id, status string, exitCode int) {
+	seedJobRecordWithRef(t, home, id, status, exitCode, "d7ab0d01abcdef")
+}
+
+func seedJobRecordWithRef(t *testing.T, home, id, status string, exitCode int, ref string) {
 	t.Helper()
 	dir := filepath.Join(home, ".pushguard", "jobs")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -200,14 +205,14 @@ func seedJobRecord(t *testing.T, home, id, status string, exitCode int) {
 		"status": %q,
 		"repo_path": "/repo/c1m-server",
 		"branch": "main",
-		"ref": "d7ab0d01abcdef",
+		"ref": %q,
 		"commit_sha": "635ee5063abcdef",
 		"command": ["make", "pre-push"],
 		"exit_code": %d,
 		"created_at": "2026-09-07T10:00:00Z",
 		"started_at": "2026-09-07T10:00:01Z",
 		"finished_at": "2026-09-07T10:11:00Z"
-	}`, id, status, exitCode)
+	}`, id, status, ref, exitCode)
 	if err := os.WriteFile(filepath.Join(dir, id+".json"), []byte(record), 0o644); err != nil {
 		t.Fatalf("write job record: %v", err)
 	}
@@ -284,6 +289,20 @@ func TestCLI_ListReadsStoredRecordsWithoutDaemon(t *testing.T) {
 	}
 }
 
+func TestCLI_OfflineListHonorsRefAndLimit(t *testing.T) {
+	home := t.TempDir()
+	seedJobRecordWithRef(t, home, "pg_listwanted", "passed", 0, "wanted-ref")
+	seedJobRecordWithRef(t, home, "pg_listother", "passed", 0, "other-ref")
+
+	stdout, stderr, code := runInHome(t, home, "list", "--ref", "wanted-ref", "--limit", "1")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr=%q)", code, stderr)
+	}
+	if !strings.Contains(stdout, "pg_listwanted") || strings.Contains(stdout, "pg_listother") {
+		t.Fatalf("offline ref filter was ignored: %q", stdout)
+	}
+}
+
 // Warn about a record that outlived its daemon: it says RUNNING but nothing is.
 func TestCLI_OfflineListWarnsThatInFlightRecordsAreNotRunning(t *testing.T) {
 	home := t.TempDir()
@@ -323,7 +342,7 @@ func TestExitCodeFor(t *testing.T) {
 		{"nor a failure", core.StatusCancelled, 1, exitJobNoVerdict},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := exitCodeFor(&core.Job{Status: tc.status, ExitCode: tc.exitCode})
+			got := exitCodeFor(api.Job{Status: api.JobStatus(tc.status), ExitCode: tc.exitCode})
 			if got != tc.want {
 				t.Fatalf("exitCodeFor(%s, exit %d) = %d, want %d", tc.status, tc.exitCode, got, tc.want)
 			}

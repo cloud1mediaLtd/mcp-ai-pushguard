@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 
@@ -58,16 +59,35 @@ func (s *MemoryStore) Save(job *core.Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if _, exists := s.jobs[job.ID]; exists {
+		return fmt.Errorf("job %s already exists", job.ID)
+	}
 	s.jobs[job.ID] = job
 	s.order = append([]string{job.ID}, s.order...)
 
-	// Trim oldest if exceeding capacity
-	if len(s.order) > s.capacity {
-		evictID := s.order[len(s.order)-1]
-		s.order = s.order[:len(s.order)-1]
-		delete(s.jobs, evictID)
-	}
+	s.trimLocked()
 	return nil
+}
+
+// trimLocked limits completed history without ever evicting active jobs.
+func (s *MemoryStore) trimLocked() {
+	completed := 0
+	order := make([]string, 0, len(s.order))
+	for _, id := range s.order {
+		job, ok := s.jobs[id]
+		if !ok {
+			continue
+		}
+		if job.IsFinished() {
+			completed++
+			if completed > s.capacity {
+				delete(s.jobs, id)
+				continue
+			}
+		}
+		order = append(order, id)
+	}
+	s.order = order
 }
 
 // Get retrieves a job by ID.
@@ -109,6 +129,7 @@ func (s *MemoryStore) Update(job *core.Job) error {
 		return ErrJobNotFound
 	}
 	s.jobs[job.ID] = job
+	s.trimLocked()
 	return nil
 }
 

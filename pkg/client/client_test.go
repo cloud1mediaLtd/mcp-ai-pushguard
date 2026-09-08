@@ -10,6 +10,7 @@ import (
 	"github.com/pushguard/pushguard/internal/core"
 	"github.com/pushguard/pushguard/internal/daemon"
 	"github.com/pushguard/pushguard/internal/store"
+	"github.com/pushguard/pushguard/internal/verification/application"
 	"github.com/pushguard/pushguard/pkg/client"
 )
 
@@ -32,7 +33,7 @@ func TestDaemonAndClientLifecycle(t *testing.T) {
 		nil,
 	)
 
-	server := daemon.NewServer(engine, daemon.Config{SocketPath: socketPath})
+	server := daemon.NewServer(application.NewEngineService(engine), daemon.Config{SocketPath: socketPath})
 	if err := server.Start(); err != nil {
 		t.Fatalf("failed to start daemon server: %v", err)
 	}
@@ -95,7 +96,7 @@ func TestEnsureDaemon_NoOpWhenAlreadyRunning(t *testing.T) {
 	memStore := store.NewMemoryStore(10)
 	engine := core.NewEngine(core.EngineConfig{MaxConcurrent: 1}, memStore, nil, nil, nil, nil)
 
-	server := daemon.NewServer(engine, daemon.Config{SocketPath: socketPath})
+	server := daemon.NewServer(application.NewEngineService(engine), daemon.Config{SocketPath: socketPath})
 	if err := server.Start(); err != nil {
 		t.Fatalf("failed to start daemon server: %v", err)
 	}

@@ -16,6 +16,9 @@ func TestDetectCommand(t *testing.T) {
 
 	// Case 1: Empty fallback
 	d1 := DetectCommand(tempDir)
+	if len(d1.Command) != 0 {
+		t.Fatalf("no detected suite must not produce a passing command: %v", d1.Command)
+	}
 	if d1.Source != "fallback" {
 		t.Errorf("expected fallback, got %s", d1.Source)
 	}

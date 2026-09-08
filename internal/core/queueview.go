@@ -17,7 +17,7 @@ func SortForQueueView(jobs []*Job) {
 		if j == nil {
 			return 3
 		}
-		switch j.Status {
+		switch j.StatusValue() {
 		case StatusRunning:
 			return 0
 		case StatusQueued:

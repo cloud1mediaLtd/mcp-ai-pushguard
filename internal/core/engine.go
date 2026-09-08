@@ -2,9 +2,13 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,7 +26,7 @@ type LogPruner interface {
 	PruneOldLogs(maxAge time.Duration) (int, error)
 }
 
-// DetectorFunc analyzes a directory to detect an appropriate test command.
+// DetectorFunc analyzes selected-commit root metadata to detect a test command.
 type DetectorFunc func(dir string) []string
 
 // NotifierInterface alerts upon job termination.
@@ -41,10 +45,11 @@ type StoreInterface interface {
 
 // EngineConfig configures the test queue engine.
 type EngineConfig struct {
-	MaxConcurrent int
-	DefaultTimeout time.Duration
+	MaxConcurrent   int
+	DefaultTimeout  time.Duration
 	BaseWorktreeDir string
-	BaseLogDir string
+	BaseLogDir      string
+	Build           string
 }
 
 // Engine orchestrates background testing in isolated git worktrees.
@@ -56,15 +61,20 @@ type Engine struct {
 	notifier      NotifierInterface
 	detectCommand DetectorFunc
 
-	queue         chan *Job
-	cancels       map[string]context.CancelFunc
-	cancelsMu     sync.Mutex
-	stopChan      chan struct{}
-	wg            sync.WaitGroup
+	queue     chan *Job
+	cancels   map[string]context.CancelFunc
+	contexts  map[string]context.Context
+	draining  bool
+	started   bool
+	stopOnce  sync.Once
+	cancelsMu sync.Mutex
+	stopChan  chan struct{}
+	wg        sync.WaitGroup
 
 	// lastActivity is a UnixNano timestamp, updated whenever a job is
 	// enqueued or finishes. It backs the daemon's idle-shutdown timer.
 	lastActivity atomic.Int64
+	startedAt    atomic.Int64
 }
 
 // NewEngine creates and initializes a PushGuard engine.
@@ -92,6 +102,7 @@ func NewEngine(
 		detectCommand: df,
 		queue:         make(chan *Job, 200),
 		cancels:       make(map[string]context.CancelFunc),
+		contexts:      make(map[string]context.Context),
 		stopChan:      make(chan struct{}),
 	}
 	e.lastActivity.Store(time.Now().UnixNano())
@@ -108,30 +119,86 @@ func (e *Engine) IdleDuration() time.Duration {
 	return time.Since(time.Unix(0, e.lastActivity.Load()))
 }
 
-// ActiveJobCount returns the number of jobs currently queued or running.
+// ActiveJobCount includes every accepted job until its cleanup and finalization finish.
 func (e *Engine) ActiveJobCount() int {
 	e.cancelsMu.Lock()
-	running := len(e.cancels)
-	e.cancelsMu.Unlock()
-	return running + len(e.queue)
+	defer e.cancelsMu.Unlock()
+	return len(e.cancels)
 }
 
-// Start launches the worker pool.
+// TryDrainIdle atomically closes admission if the engine is idle long enough.
+func (e *Engine) TryDrainIdle(idle time.Duration) bool {
+	e.cancelsMu.Lock()
+	defer e.cancelsMu.Unlock()
+	if e.draining || len(e.cancels) != 0 || e.IdleDuration() < idle {
+		return false
+	}
+	e.draining = true
+	return true
+}
+
+// Start launches the worker pool at most once.
 func (e *Engine) Start() {
+	e.cancelsMu.Lock()
+	defer e.cancelsMu.Unlock()
+	if e.started || e.draining {
+		return
+	}
+	e.started = true
+	e.startedAt.CompareAndSwap(0, time.Now().UnixNano())
 	for i := 0; i < e.config.MaxConcurrent; i++ {
 		e.wg.Add(1)
 		go e.workerLoop(i)
 	}
 }
 
-// Stop signals workers to stop and waits for in-flight tasks.
-func (e *Engine) Stop() {
-	close(e.stopChan)
-	e.wg.Wait()
+// QueueDepth reports jobs waiting for a worker. It excludes a currently
+// running job, which is included in ActiveJobCount.
+func (e *Engine) QueueDepth() int { return len(e.queue) }
+
+// Uptime reports how long workers have been available in this daemon process.
+func (e *Engine) Uptime() time.Duration {
+	started := e.startedAt.Load()
+	if started == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, started))
 }
 
-// Enqueue validates the request, inspects git state, schedules the job, and returns its queue position.
+// Stop closes admission, cancels accepted work, and waits for cleanup. It is idempotent.
+func (e *Engine) Stop() {
+	e.stopOnce.Do(func() {
+		e.cancelsMu.Lock()
+		e.draining = true
+		for _, cancel := range e.cancels {
+			cancel()
+		}
+		close(e.stopChan)
+		e.cancelsMu.Unlock()
+		e.wg.Wait()
+		// Engines can be stopped without ever starting their workers.
+		for {
+			select {
+			case job := <-e.queue:
+				e.executeJob(job)
+			default:
+				return
+			}
+		}
+	})
+}
+
+// Enqueue freezes the requested commit before publishing an accepted job.
 func (e *Engine) Enqueue(req EnqueueRequest) (*Job, int, error) {
+	if req.AutoPush {
+		return nil, 0, fmt.Errorf("auto-push is disabled; push the verified commit explicitly")
+	}
+	if req.Snapshot && req.Ref != "" {
+		return nil, 0, fmt.Errorf("snapshot and ref cannot be combined")
+	}
+	if req.Timeout < 0 {
+		return nil, 0, fmt.Errorf("timeout cannot be negative")
+	}
 	if req.RepoPath == "" {
 		req.RepoPath = "."
 	}
@@ -139,35 +206,50 @@ func (e *Engine) Enqueue(req EnqueueRequest) (*Job, int, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("invalid git repository at %q: %w", req.RepoPath, err)
 	}
-
-	branch, _ := git.GetCurrentBranch(repoRoot)
-	headSHA, _ := git.GetHeadSHA(repoRoot)
-
-	targetRef := req.Ref
-	if targetRef == "" || targetRef == "HEAD" {
-		// Check for uncommitted work-in-progress changes
-		dirty, _ := git.HasUncommittedChanges(repoRoot)
-		if dirty {
-			stashSHA, err := git.CreateDirtySnapshotCommit(repoRoot)
-			if err == nil && stashSHA != "" {
-				targetRef = stashSHA
-			} else {
-				targetRef = headSHA
-			}
-		} else {
-			targetRef = headSHA
+	branch, err := git.GetCurrentBranch(repoRoot)
+	if err != nil {
+		return nil, 0, err
+	}
+	baseSHA, err := git.ResolveCommit(repoRoot, "HEAD")
+	if err != nil {
+		return nil, 0, err
+	}
+	requestedRef := req.Ref
+	if requestedRef == "" {
+		requestedRef = "HEAD"
+	}
+	targetRef := baseSHA
+	if requestedRef != "HEAD" {
+		targetRef, err = git.ResolveCommit(repoRoot, requestedRef)
+		if err != nil {
+			return nil, 0, err
 		}
 	}
-
-	// Auto-detect command if unspecified
-	cmd := req.Command
+	sourceKind := "commit"
+	if req.Snapshot {
+		sourceKind = "snapshot"
+		snapshot, err := git.CreateSnapshotCommit(repoRoot, baseSHA)
+		if err != nil {
+			return nil, 0, fmt.Errorf("create working-tree snapshot: %w", err)
+		}
+		if snapshot != "" {
+			targetRef = snapshot
+		}
+	}
+	cmd := append([]string(nil), req.Command...)
 	if len(cmd) == 0 && e.detectCommand != nil {
-		cmd = e.detectCommand(repoRoot)
+		detectionDir, err := git.DetectionDir(repoRoot, targetRef)
+		if err != nil {
+			return nil, 0, err
+		}
+		cmd = append([]string(nil), e.detectCommand(detectionDir)...)
+		if err := os.RemoveAll(detectionDir); err != nil {
+			return nil, 0, fmt.Errorf("remove temporary verification metadata: %w", err)
+		}
 	}
-	if len(cmd) == 0 {
-		cmd = []string{"echo", "No tests defined"}
+	if len(cmd) == 0 || strings.TrimSpace(cmd[0]) == "" {
+		return nil, 0, fmt.Errorf("no verification command found; provide an explicit command")
 	}
-
 	name := req.Name
 	if name == "" {
 		name = filepath.Base(repoRoot)
@@ -175,37 +257,60 @@ func (e *Engine) Enqueue(req EnqueueRequest) (*Job, int, error) {
 			name = fmt.Sprintf("%s (%s)", name, branch)
 		}
 	}
-
-	job := &Job{
-		ID:        GenerateJobID(),
-		Name:      name,
-		RepoPath:  repoRoot,
-		Ref:       targetRef,
-		CommitSHA: headSHA,
-		Branch:    branch,
-		Command:   cmd,
-		AutoPush:  req.AutoPush,
-		Status:    StatusQueued,
-		CreatedAt: time.Now(),
+	timeout := req.Timeout
+	if timeout == 0 {
+		timeout = e.config.DefaultTimeout
 	}
-
-	if err := e.store.Save(job); err != nil {
-		return nil, 0, fmt.Errorf("failed to save job: %w", err)
+	snapshotBase := ""
+	if req.Snapshot {
+		snapshotBase = baseSHA
 	}
-
-	select {
-	case e.queue <- job:
-		e.touchActivity()
-		position := len(e.queue)
-		return job, position, nil
-	default:
+	dedupeKey := ""
+	if !req.Snapshot {
+		dedupeKey = strings.TrimSpace(req.DedupeKey)
+	}
+	if dedupeKey == "" && !req.Snapshot {
+		// The default identity is deliberately exact: same checkout, immutable
+		// commit, and command. Snapshot jobs always run independently because
+		// their generated commit is the only trustworthy identity.
+		dedupeKey = repoRoot + "\x00" + targetRef + "\x00" + strings.Join(cmd, "\x00")
+	}
+	job := &Job{ID: GenerateJobID(), Name: name, RepoPath: repoRoot, Ref: targetRef,
+		RequestedRef: requestedRef, SourceKind: sourceKind, BaseSHA: snapshotBase,
+		CommitSHA: targetRef, Branch: branch, Command: cmd, Timeout: timeout,
+		Status: StatusQueued, CreatedAt: time.Now(), DaemonBuild: e.config.Build, DedupeKey: dedupeKey}
+	// Admission, persistence and publication share a lock with idle shutdown.
+	e.cancelsMu.Lock()
+	defer e.cancelsMu.Unlock()
+	if e.draining {
+		return nil, 0, fmt.Errorf("engine is draining; retry with a running daemon")
+	}
+	if dedupeKey != "" {
+		for _, existing := range e.store.List(0) {
+			if existing.RepoPath != repoRoot || existing.DedupeKey != dedupeKey || existing.IsFinished() {
+				continue
+			}
+			reused := existing.Snapshot()
+			reused.Reused = true
+			return reused, 0, nil
+		}
+	}
+	if len(e.queue) == cap(e.queue) {
 		return nil, 0, fmt.Errorf("queue is full")
 	}
+	if err := e.store.Save(job); err != nil {
+		return nil, 0, fmt.Errorf("save queued job: %w", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	e.cancels[job.ID] = cancel
+	e.contexts[job.ID] = ctx
+	e.queue <- job
+	e.touchActivity()
+	return job.Snapshot(), len(e.queue), nil
 }
 
-func (e *Engine) workerLoop(workerID int) {
+func (e *Engine) workerLoop(_ int) {
 	defer e.wg.Done()
-
 	for {
 		select {
 		case <-e.stopChan:
@@ -217,114 +322,142 @@ func (e *Engine) workerLoop(workerID int) {
 }
 
 func (e *Engine) executeJob(job *Job) {
-	// If already cancelled while waiting in queue
-	if job.IsFinished() {
-		return
-	}
-
-	job.setRunning(time.Now())
-	_ = e.store.Update(job)
-
-	ctx, cancel := context.WithTimeout(context.Background(), e.config.DefaultTimeout)
 	e.cancelsMu.Lock()
-	e.cancels[job.ID] = cancel
-	e.cancelsMu.Unlock()
-
-	defer func() {
-		cancel()
-		e.cancelsMu.Lock()
-		delete(e.cancels, job.ID)
+	parent, ok := e.contexts[job.ID]
+	if !ok {
 		e.cancelsMu.Unlock()
-	}()
-
-	// 1. Create worktree
-	worktreeDir, err := e.worktrees.CreateWorktree(job.RepoPath, job.ID, job.Ref)
-	if err != nil {
-		job.setFailed(fmt.Sprintf("worktree setup failed: %s", err))
-		e.finalizeJob(job)
+		return
+	} // Queued cancellation already finalized.
+	if parent.Err() != nil {
+		message := "job was cancelled"
+		if e.draining {
+			message = "engine shut down while this job was queued; re-enqueue it"
+		}
+		e.finishLocked(job, 130, StatusCancelled, message)
+		e.cancelsMu.Unlock()
+		e.notify(job)
 		return
 	}
-	job.setWorktreeDir(worktreeDir)
-
-	// Guarantee worktree removal
-	defer func() {
-		_ = e.worktrees.RemoveWorktree(job.RepoPath, worktreeDir)
-	}()
-
-	// 2. Run test execution
-	exitCode, runErr := e.runner.Run(ctx, job, worktreeDir)
-
+	job.setRunning(time.Now())
+	if err := e.store.Update(job); err != nil {
+		e.finishLocked(job, 1, StatusFailed, "persist running job: "+err.Error())
+		e.cancelsMu.Unlock()
+		e.notify(job)
+		return
+	}
+	e.cancelsMu.Unlock()
+	ctx, cancel := context.WithTimeout(parent, job.Timeout)
+	defer cancel()
+	worktreeDir, setupErr := e.worktrees.CreateWorktreeContext(ctx, job.RepoPath, job.ID, job.Ref)
+	exitCode := 1
+	var runErr error
+	if setupErr == nil {
+		job.setWorktreeDir(worktreeDir)
+		if err := e.store.Update(job); err != nil {
+			runErr = fmt.Errorf("persist worktree location: %w", err)
+		} else {
+			exitCode, runErr = e.runner.Run(ctx, job, worktreeDir)
+		}
+		if err := e.worktrees.RemoveWorktree(job.RepoPath, worktreeDir); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("worktree cleanup failed: %w", err))
+		}
+	} else {
+		runErr = fmt.Errorf("worktree setup failed: %w", setupErr)
+	}
+	// A terminal result is published only after the checkout has been cleaned.
+	e.cancelsMu.Lock()
+	status, message := StatusFailed, ""
 	switch {
-	case ctx.Err() == context.Canceled:
-		job.setResult(exitCode, StatusCancelled, "job was cancelled")
-	case ctx.Err() == context.DeadlineExceeded:
-		job.setResult(exitCode, StatusFailed, "test run timed out")
+	case errors.Is(ctx.Err(), context.Canceled):
+		status, message = StatusCancelled, "job was cancelled"
+		if e.draining {
+			message = "engine shut down while this job was running; re-enqueue it"
+		}
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		message = "test run timed out"
 	case exitCode == 0 && runErr == nil:
-		job.setResult(exitCode, StatusPassed, "")
-
-		// Auto-push if requested and branch is valid
-		if job.AutoPush && job.Branch != "" && job.Branch != "HEAD" {
-			pushErr := git.Push(job.RepoPath, job.Branch)
-			if pushErr != nil {
-				job.AppendLog(fmt.Sprintf("[pushguard] auto-push failed: %s", pushErr))
-			} else {
-				job.AppendLog(fmt.Sprintf("[pushguard] successfully pushed %s to origin", job.Branch))
-			}
-		}
-	default:
-		errMsg := ""
-		if runErr != nil {
-			errMsg = runErr.Error()
-		}
-		job.setResult(exitCode, StatusFailed, errMsg)
+		status = StatusPassed
+	case runErr != nil:
+		message = runErr.Error()
 	}
-
-	e.finalizeJob(job)
+	if runErr != nil && message != runErr.Error() {
+		message += "; " + runErr.Error()
+	}
+	e.finishLocked(job, exitCode, status, message)
+	e.cancelsMu.Unlock()
+	e.notify(job)
 }
 
-func (e *Engine) finalizeJob(job *Job) {
-	job.finalize(time.Now())
-
-	_ = e.store.Update(job)
+// finishLocked is the single terminal transition; callers hold cancelsMu.
+func (e *Engine) finishLocked(job *Job, exitCode int, status JobStatus, message string) {
+	result := job.Snapshot()
+	result.setResult(exitCode, status, message)
+	result.finalize(time.Now())
+	if err := e.store.Update(result); err != nil {
+		job.setResult(1, StatusFailed, "persist terminal result: "+err.Error())
+		job.finalize(time.Now())
+		slog.Error("failed to persist job result", "job_id", job.ID, "error", err)
+	} else {
+		job.setResult(exitCode, status, message)
+		job.finalize(*result.FinishedAt)
+	}
+	if cancel := e.cancels[job.ID]; cancel != nil {
+		cancel()
+	}
+	delete(e.cancels, job.ID)
+	delete(e.contexts, job.ID)
 	e.touchActivity()
+}
 
+func (e *Engine) notify(job *Job) {
 	if e.notifier != nil {
-		_ = e.notifier.Notify(job)
+		if err := e.notifier.Notify(job.Snapshot()); err != nil {
+			slog.Warn("job notification failed", "job_id", job.ID, "error", err)
+		}
 	}
 }
 
-// Cancel cancels a running or queued job.
+// Cancel requests cancellation. Running jobs finish only after process and worktree cleanup.
 func (e *Engine) Cancel(jobID string) error {
+	e.cancelsMu.Lock()
 	job, err := e.store.Get(jobID)
 	if err != nil {
+		e.cancelsMu.Unlock()
 		return err
 	}
-
-	e.cancelsMu.Lock()
 	cancel, ok := e.cancels[jobID]
-	e.cancelsMu.Unlock()
-
-	if ok {
-		cancel()
-	}
-
-	if !job.setCancelled("cancelled by user") {
-		// Already in a terminal state — e.g. it passed/failed a moment ago.
-		// Report that instead of clobbering a real result with "cancelled".
+	if !ok || job.IsFinished() {
+		e.cancelsMu.Unlock()
 		return fmt.Errorf("job %s is already finished", jobID)
 	}
-	_ = e.store.Update(job)
+	cancel()
+	queued := job.StatusValue() == StatusQueued
+	if queued {
+		e.finishLocked(job, 130, StatusCancelled, "cancelled by user")
+	}
+	e.cancelsMu.Unlock()
+	if queued {
+		e.notify(job)
+	}
 	return nil
 }
 
 // GetJob fetches a job by ID.
 func (e *Engine) GetJob(id string) (*Job, error) {
-	return e.store.Get(id)
+	job, err := e.store.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	return job.Snapshot(), nil
 }
 
 // ListJobs returns the most recent jobs.
 func (e *Engine) ListJobs(limit int) []*Job {
-	return e.store.List(limit)
+	jobs := e.store.List(limit)
+	for i, job := range jobs {
+		jobs[i] = job.Snapshot()
+	}
+	return jobs
 }
 
 // AwaitJob blocks until the job finishes or ctx expires.
@@ -341,12 +474,12 @@ func (e *Engine) AwaitJob(ctx context.Context, jobID string, pollInterval time.D
 			return nil, err
 		}
 		if job.IsFinished() {
-			return job, nil
+			return job.Snapshot(), nil
 		}
 
 		select {
 		case <-ctx.Done():
-			return job, ctx.Err()
+			return job.Snapshot(), ctx.Err()
 		case <-ticker.C:
 		}
 	}
@@ -422,4 +555,3 @@ func (e *Engine) Clean() CleanReport {
 		AllocBytesAfter: m.Alloc,
 	}
 }
-

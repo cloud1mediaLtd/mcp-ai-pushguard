@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,9 +15,10 @@ import (
 
 	"github.com/pushguard/pushguard/internal/core"
 	"github.com/pushguard/pushguard/internal/git"
-	"github.com/pushguard/pushguard/internal/notifier"
 	"github.com/pushguard/pushguard/internal/runner"
 	"github.com/pushguard/pushguard/internal/store"
+	"github.com/pushguard/pushguard/internal/verification/application"
+	"github.com/pushguard/pushguard/pkg/api"
 	"github.com/pushguard/pushguard/pkg/client"
 )
 
@@ -51,8 +54,8 @@ type Server struct {
 // shared daemon (so every caller ends up on one coordinated queue instead of
 // silently forking off isolated engines), and only falls back to an embedded
 // in-process engine if that spawn fails.
-func NewServer() *Server {
-	return newServerWithClient(client.New(""))
+func NewServer(build string) *Server {
+	return newServerWithClient(client.New("", client.WithBuild(build)))
 }
 
 // newServerWithClient builds a Server around an already-constructed client,
@@ -65,8 +68,11 @@ func newServerWithClient(c *client.Client) *Server {
 		// Auto-start failed (binary not locatable, spawn error, etc.) — fall
 		// back to an embedded engine scoped to this process only. stdout is
 		// the JSON-RPC channel, so this diagnostic goes to stderr only.
-		fmt.Fprintf(os.Stderr, "pushguard: daemon auto-start failed, using embedded engine: %s\n", err)
-		s.ensureEmbeddedEngine()
+		if errors.Is(err, client.ErrIncompatible) {
+			fmt.Fprintf(os.Stderr, "pushguard: %s\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "pushguard: shared daemon unavailable; submissions may use an embedded engine: %s\n", err)
+		}
 	}
 
 	return s
@@ -89,33 +95,36 @@ func redisAddrFromEnv() string {
 // or someone killing it) after this server started with the daemon up and
 // s.engine still nil. Serve() processes one request at a time off a single
 // goroutine, so no locking is needed around this lazy init.
-func (s *Server) ensureEmbeddedEngine() *core.Engine {
+func (s *Server) ensureEmbeddedEngine() (*core.Engine, error) {
 	if s.engine != nil {
-		return s.engine
+		return s.engine, nil
 	}
-	memStore := store.NewMemoryStore(100)
-	wm, _ := git.NewWorktreeManager("")
-	r, _ := runner.NewLocalRunner("")
-	notifiers := []notifier.Notifier{notifier.NewMacOSNotifier(), &notifier.TerminalBellNotifier{}}
-	if addr := redisAddrFromEnv(); addr != "" {
-		if rn, err := notifier.NewRedisNotifier(addr, ""); err == nil {
-			notifiers = append(notifiers, rn)
-		}
-		// Unreachable Redis is not worth logging here: this is already the
-		// degraded fallback path (daemon unreachable), and stdout is the
-		// JSON-RPC channel.
+	base, err := os.MkdirTemp("", "pushguard-embedded-")
+	if err != nil {
+		return nil, err
 	}
-	n := notifier.NewMultiNotifier(notifiers...)
-
-	cfg := core.EngineConfig{
-		MaxConcurrent:  1,
-		DefaultTimeout: 10 * time.Minute,
+	wm, err := git.NewWorktreeManager(filepath.Join(base, "worktrees"))
+	if err != nil {
+		return nil, err
 	}
-	s.engine = core.NewEngine(cfg, memStore, wm, r, n, func(dir string) []string {
-		return runner.DetectCommand(dir).Command
-	})
+	r, err := runner.NewLocalRunner(filepath.Join(base, "logs"))
+	if err != nil {
+		return nil, err
+	}
+	s.engine = core.NewEngine(core.EngineConfig{DefaultTimeout: 15 * time.Minute}, store.NewMemoryStore(100), wm, r, nil,
+		func(dir string) []string { return runner.DetectCommand(dir).Command })
 	s.engine.Start()
-	return s.engine
+	return s.engine, nil
+}
+
+// localJob routes session-owned jobs to their original engine, even after daemon recovery.
+func (s *Server) localJob(id string) (*core.Job, bool) {
+	if s.engine != nil {
+		if job, err := s.engine.GetJob(id); err == nil {
+			return job.Snapshot(), true
+		}
+	}
+	return nil, false
 }
 
 // Serve reads JSON-RPC requests from in and writes to out.
@@ -157,7 +166,7 @@ func (s *Server) handleRequest(out io.Writer, req JSONRPCRequest) {
 			},
 			"serverInfo": map[string]any{
 				"name":    "pushguard",
-				"version": "0.1.0",
+				"version": "0.2.0",
 			},
 		})
 
@@ -194,8 +203,11 @@ func (s *Server) handleToolsList(out io.Writer, id any) {
 					},
 					"ref": map[string]any{
 						"type":        "string",
-						"description": "Git ref/commit to test (e.g., 'HEAD' or specific commit). If dirty files exist, PushGuard automatically creates an isolated snapshot without touching your working tree.",
+						"description": "Git ref/commit to test (e.g., 'HEAD' or specific commit). Defaults to committed HEAD. Cannot combine with snapshot.",
 					},
+					"snapshot":        map[string]any{"type": "boolean", "description": "Explicitly test a working-tree snapshot; cannot combine with ref."},
+					"dedupe_key":      map[string]any{"type": "string", "description": "Stable verification identity; reuses an active matching job."},
+					"timeout_seconds": map[string]any{"type": "integer", "minimum": 1, "description": "Execution timeout in seconds (default: 900)."},
 					"command": map[string]any{
 						"type":        "string",
 						"description": "Optional test command to run (e.g. 'go test ./...', 'pnpm test'). Auto-detected if omitted.",
@@ -206,7 +218,7 @@ func (s *Server) handleToolsList(out io.Writer, id any) {
 					},
 					"auto_push": map[string]any{
 						"type":        "boolean",
-						"description": "If true, automatically pushes to origin branch when all tests pass.",
+						"description": "Disabled; true is rejected. Push separately with explicit authorization.",
 					},
 				},
 				"required": []string{},
@@ -232,13 +244,17 @@ func (s *Server) handleToolsList(out io.Writer, id any) {
 		},
 		{
 			"name":        "pushguard_list",
-			"description": "List all queued, running, and recently finished PushGuard verification jobs.",
+			"description": "List queue state, or find jobs already submitted for an exact commit/ref.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"limit": map[string]any{
 						"type":        "integer",
 						"description": "Max number of jobs to return (default: 10).",
+					},
+					"ref": map[string]any{
+						"type":        "string",
+						"description": "Exact tested SHA or requested ref to find; use before submitting duplicate verification.",
 					},
 				},
 			},
@@ -269,7 +285,7 @@ func (s *Server) handleToolsList(out io.Writer, id any) {
 					},
 					"timeout_seconds": map[string]any{
 						"type":        "integer",
-						"description": "Timeout in seconds to wait (default: 300).",
+						"description": "Timeout in seconds to wait (default: 1500); expiration leaves the job running.",
 					},
 				},
 				"required": []string{"job_id"},
@@ -334,28 +350,49 @@ func (s *Server) toolEnqueue(out io.Writer, id any, args map[string]any) {
 	cmdStr, _ := args["command"].(string)
 	name, _ := args["name"].(string)
 	autoPush, _ := args["auto_push"].(bool)
+	snapshot, _ := args["snapshot"].(bool)
+	dedupeKey, _ := args["dedupe_key"].(string)
+	timeout, err := secondsArgument(args, "timeout_seconds", 900)
+	if err != nil || autoPush || (snapshot && ref != "") {
+		s.sendToolText(out, id, "Invalid submission: auto-push is disabled; snapshot/ref are exclusive; timeout must be positive integer seconds.", true)
+		return
+	}
 
 	var cmd []string
 	if cmdStr != "" {
-		cmd = strings.Fields(cmdStr)
+		cmd = []string{cmdStr}
 	}
 
-	req := core.EnqueueRequest{
-		RepoPath: repoPath,
-		Ref:      ref,
-		Command:  cmd,
-		Name:     name,
-		AutoPush: autoPush,
+	req := api.EnqueueRequest{
+		RepoPath:  repoPath,
+		Ref:       ref,
+		Command:   cmd,
+		Name:      name,
+		AutoPush:  autoPush,
+		Snapshot:  snapshot,
+		Timeout:   timeout,
+		DedupeKey: dedupeKey,
 	}
 
-	var job *core.Job
+	var job api.Job
 	var pos int
-	var err error
 
 	if s.client.IsDaemonRunning() {
-		job, pos, err = s.client.Enqueue(req)
+		var remote *api.Job
+		remote, pos, err = s.client.Enqueue(req)
+		if remote != nil {
+			job = *remote
+		}
 	} else {
-		job, pos, err = s.ensureEmbeddedEngine().Enqueue(req)
+		var engine *core.Engine
+		engine, err = s.ensureEmbeddedEngine()
+		if err == nil {
+			var local *core.Job
+			local, pos, err = engine.Enqueue(core.EnqueueRequest{RepoPath: req.RepoPath, Ref: req.Ref, Command: req.Command, Name: req.Name, AutoPush: req.AutoPush, Snapshot: req.Snapshot, Timeout: req.Timeout, DedupeKey: req.DedupeKey})
+			if local != nil {
+				job = application.Snapshot(local)
+			}
+		}
 	}
 
 	if err != nil {
@@ -363,18 +400,15 @@ func (s *Server) toolEnqueue(out io.Writer, id any, args map[string]any) {
 		return
 	}
 
-	msg := fmt.Sprintf(
-		"✅ PushGuard Job Enqueued!\n\n"+
-			"- **Job ID**: `%s`\n"+
-			"- **Repository**: `%s`\n"+
-			"- **Branch/Ref**: `%s`\n"+
-			"- **Command**: `%s`\n"+
-			"- **Queue Position**: %d\n"+
-			"- **Auto-Push on Pass**: %v\n\n"+
-			"💡 *Your working tree remains 100%% unlocked.* Tests are running in an isolated git worktree.\n"+
-			"PushGuard will ping you via macOS notification when done. You can also call `pushguard_status(job_id=%q)`.",
-		job.ID, job.RepoPath, job.Ref, strings.Join(job.Command, " "), pos, job.AutoPush, job.ID,
-	)
+	verb := "enqueued"
+	if job.Reused {
+		verb = "reused from an active verification"
+	}
+	msg := fmt.Sprintf("Job `%s` %s.\n\n- Repository: `%s`\n- Source: %s\n- Tested SHA: `%s`\n- Requested ref: `%s`\n- Base SHA: `%s`\n- Command: `%s`\n- Queue position: %d\n\nContinue working, then collect the result. For a tracked background wait, run `pushguard await %s --timeout 1500`. Desktop notifications reach the human, not the agent.", job.ID, verb, job.RepoPath, job.SourceKind, job.Ref, job.RequestedRef, job.BaseSHA, strings.Join(job.Command, " "), pos, job.ID)
+
+	if _, local := s.localJob(job.ID); local {
+		msg = fmt.Sprintf("Job `%s` enqueued in this MCP session's private engine.\nSource: %s; tested SHA: `%s`; requested ref: `%s`; base SHA: `%s`; command: `%s`.\nCollect it using this session's pushguard_await or pushguard_status. CLI await cannot see this job, and it cannot outlive this MCP process.", job.ID, job.SourceKind, job.Ref, job.RequestedRef, job.BaseSHA, strings.Join(job.Command, " "))
+	}
 
 	s.sendToolText(out, id, msg, false)
 }
@@ -397,27 +431,24 @@ func (s *Server) toolStatus(out io.Writer, id any, args map[string]any) {
 		scanLines = 400
 	}
 
-	var job *core.Job
+	var job api.Job
 	var logs string
 	var err error
 	var offlineNote string
 
-	if s.client.IsDaemonRunning() {
-		job, err = s.client.GetJob(jobID)
+	if local, ok := s.localJob(jobID); ok {
+		job = application.Snapshot(local)
+		logs = local.TailLogs(scanLines)
+	} else {
+		var remote *api.Job
+		remote, err = s.client.GetJob(jobID)
+		if remote != nil {
+			job = *remote
+		}
 		if err == nil {
 			logs, _ = s.client.GetLogs(jobID, scanLines)
-		}
-	} else {
-		// The embedded engine only knows jobs THIS process ran. Everything the
-		// daemon ran before it idled out is invisible to it, so asking it about
-		// a job from an hour ago answers "not found" — indistinguishable from a
-		// typo'd id, and the reason a caller goes looking for a bug in their own
-		// command instead of collecting their result.
-		job, err = s.ensureEmbeddedEngine().GetJob(jobID)
-		if err == nil {
-			logs = job.TailLogs(scanLines)
 		} else if stored, storeErr := store.OpenReadOnly().Get(jobID); storeErr == nil {
-			job, err = stored, nil
+			job, err = application.Snapshot(stored), nil
 			logs = readJobLog(jobID)
 			offlineNote = daemonDownNote
 		}
@@ -430,13 +461,13 @@ func (s *Server) toolStatus(out io.Writer, id any, args map[string]any) {
 
 	statusEmoji := "⏳"
 	switch job.Status {
-	case core.StatusPassed:
+	case api.StatusPassed:
 		statusEmoji = "✅"
-	case core.StatusFailed:
+	case api.StatusFailed:
 		statusEmoji = "❌"
-	case core.StatusRunning:
+	case api.StatusRunning:
 		statusEmoji = "🔄"
-	case core.StatusCancelled:
+	case api.StatusCancelled:
 		statusEmoji = "⚠️"
 	}
 
@@ -446,7 +477,7 @@ func (s *Server) toolStatus(out io.Writer, id any, args map[string]any) {
 			"- **Command**: `%s`\n"+
 			"- **Duration**: %s\n",
 		job.ID, statusEmoji, strings.ToUpper(string(job.Status)), job.RepoPath, strings.Join(job.Command, " "), job.DurationString(),
-	) + offlineNote
+	) + fmt.Sprintf("- Source: %s\n- Tested SHA: `%s`\n- Requested ref: `%s`\n- Base SHA: `%s`\n", job.SourceKind, job.Ref, job.RequestedRef, job.BaseSHA) + offlineNote
 
 	if job.Error != "" {
 		msg += fmt.Sprintf("- **Error**: %s\n", job.Error)
@@ -471,30 +502,47 @@ func (s *Server) toolList(out io.Writer, id any, args map[string]any) {
 	if l, ok := args["limit"].(float64); ok && l > 0 {
 		limit = int(l)
 	}
+	ref, _ := args["ref"].(string)
 
-	var jobs []*core.Job
-	var err error
-
+	var jobs []api.Job
 	offlineNote := ""
 	if s.client.IsDaemonRunning() {
-		jobs, err = s.client.ListJobs(limit)
+		var err error
+		jobs, err = s.client.ListJobsByRef(limit, ref)
+		if err != nil {
+			s.sendToolText(out, id, fmt.Sprintf("Error listing jobs: %s", err), true)
+			return
+		}
 	} else {
-		jobs = s.ensureEmbeddedEngine().ListJobs(limit)
-		if len(jobs) == 0 {
-			// Reporting "no recent jobs" from an empty in-process store is a
-			// false negative about SHARED state: several agents queue against
-			// one daemon, and an agent told the queue is empty will happily
-			// start work another agent is already gating.
-			jobs = store.OpenReadOnly().ListFromDisk(limit)
-			if len(jobs) > 0 {
-				offlineNote = daemonDownNote
+		for _, job := range store.OpenReadOnly().ListFromDisk(limit) {
+			public := application.Snapshot(job)
+			if ref == "" || public.Ref == ref || public.CommitSHA == ref || public.RequestedRef == ref || public.BaseSHA == ref {
+				jobs = append(jobs, public)
+			}
+		}
+		if len(jobs) > 0 {
+			offlineNote = daemonDownNote
+		}
+	}
+	byID := make(map[string]api.Job)
+	for _, job := range jobs {
+		byID[job.ID] = job
+	}
+	if s.engine != nil {
+		for _, job := range s.engine.ListJobs(0) {
+			public := application.Snapshot(job)
+			if ref == "" || public.Ref == ref || public.CommitSHA == ref || public.RequestedRef == ref || public.BaseSHA == ref {
+				byID[job.ID] = public
 			}
 		}
 	}
-
-	if err != nil {
-		s.sendToolText(out, id, fmt.Sprintf("Error listing jobs: %s", err.Error()), true)
-		return
+	jobs = jobs[:0]
+	for _, job := range byID {
+		jobs = append(jobs, job)
+	}
+	application.SortForQueueView(jobs)
+	if len(jobs) > limit {
+		jobs = jobs[:limit]
 	}
 
 	if len(jobs) == 0 {
@@ -506,7 +554,7 @@ func (s *Server) toolList(out io.Writer, id any, args map[string]any) {
 	// so the questions are "what is running", "what is ahead of mine", and
 	// "which commit is each testing" — and every gate's command string looks
 	// identical, so the ref is what actually distinguishes them.
-	core.SortForQueueView(jobs)
+	application.SortForQueueView(jobs)
 
 	var sb strings.Builder
 	sb.WriteString("| ID | Status | Queue | Ref | Repo | Duration | Command |\n")
@@ -515,7 +563,7 @@ func (s *Server) toolList(out io.Writer, id any, args map[string]any) {
 	position := 0
 	for _, j := range jobs {
 		pos := "-"
-		if j.Status == core.StatusQueued {
+		if j.Status == api.StatusQueued {
 			position++
 			pos = fmt.Sprintf("%d", position)
 		}
@@ -535,10 +583,10 @@ func (s *Server) toolCancel(out io.Writer, id any, args map[string]any) {
 	}
 
 	var err error
-	if s.client.IsDaemonRunning() {
-		err = s.client.CancelJob(jobID)
+	if _, ok := s.localJob(jobID); ok {
+		err = s.engine.Cancel(jobID)
 	} else {
-		err = s.ensureEmbeddedEngine().Cancel(jobID)
+		err = s.client.CancelJob(jobID)
 	}
 
 	if err != nil {
@@ -546,7 +594,7 @@ func (s *Server) toolCancel(out io.Writer, id any, args map[string]any) {
 		return
 	}
 
-	s.sendToolText(out, id, fmt.Sprintf("Job `%s` has been cancelled.", jobID), false)
+	s.sendToolText(out, id, fmt.Sprintf("Cancellation requested for job `%s`; await its terminal result.", jobID), false)
 }
 
 func (s *Server) toolAwait(out io.Writer, id any, args map[string]any) {
@@ -555,64 +603,42 @@ func (s *Server) toolAwait(out io.Writer, id any, args map[string]any) {
 		s.sendToolText(out, id, "Error: job_id is required", true)
 		return
 	}
-	timeoutSec := 300
-	if t, ok := args["timeout_seconds"].(float64); ok && t > 0 {
-		timeoutSec = int(t)
+	timeout, err := secondsArgument(args, "timeout_seconds", 1500)
+	if err != nil {
+		s.sendToolText(out, id, err.Error(), true)
+		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-
-	var job *core.Job
-	var err error
-
-	if s.client.IsDaemonRunning() {
-		// Poll daemon
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		for {
-			job, err = s.client.GetJob(jobID)
-			if err != nil || job.IsFinished() {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				err = ctx.Err()
-				break
-			case <-ticker.C:
-			}
-		}
-	} else {
-		job, err = s.ensureEmbeddedEngine().AwaitJob(ctx, jobID, 1*time.Second)
-	}
+	job, err := s.await(ctx, jobID)
 
 	if err != nil {
 		s.sendToolText(out, id, fmt.Sprintf("Await failed: %s", err.Error()), true)
 		return
 	}
 
-	// A cancelled job reports ExitCode 0 because no process ever returned one.
-	// Rendering "completed with status: cancelled (exit code 0)" put a zero in
-	// front of a reader whose next question is "did it pass" -- and "completed"
-	// is wrong too: nothing ran. Say that instead of showing a number that
-	// means nothing here.
+	// Cancellation is not a completed verdict, regardless of the process exit code.
 	resultText := fmt.Sprintf("Job `%s` completed with status: **%s** (exit code %d) in %s.",
 		job.ID, job.Status, job.ExitCode, job.DurationString())
-	if job.Status == core.StatusCancelled {
-		resultText = fmt.Sprintf("Job `%s` was **cancelled** after %s. No checks ran, so this is not a pass and not a failure — "+
+	if job.Status == api.StatusCancelled {
+		resultText = fmt.Sprintf("Job `%s` was **cancelled** after %s. Checks did not finish; "+
 			"there is no verdict. Re-enqueue it if you still need the gate.", job.ID, job.DurationString())
 	}
-	s.sendToolText(out, id, resultText, job.Status != core.StatusPassed)
+	s.sendToolText(out, id, resultText, job.Status != api.StatusPassed)
 }
 
 func (s *Server) toolClean(out io.Writer, id any) {
-	var report *core.CleanReport
+	var report *api.CleanReport
 	var err error
 
 	if s.client.IsDaemonRunning() {
 		report, err = s.client.Clean()
 	} else {
-		r := s.ensureEmbeddedEngine().Clean()
+		if s.engine == nil {
+			s.sendToolText(out, id, "No local engine is running; no cleanup performed.", false)
+			return
+		}
+		r := application.CleanSnapshot(s.engine.Clean())
 		report = &r
 	}
 
@@ -678,19 +704,8 @@ func tailLines(s string, n int) string {
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
-// shortRef is the commit a job is actually testing.
-//
-// Job.Ref is that commit: the ref the caller asked for, or the resolved HEAD or
-// working-tree snapshot when they asked for neither. Job.CommitSHA is something
-// else entirely — the branch tip at the moment of enqueue, recorded regardless
-// of --ref.
-//
-// Preferring CommitSHA, as this first did, reports the tip for a job that is
-// deliberately gating an older SHA. That is the dangerous direction: it tells
-// you a release gate covered the tip when it covered a commit from before the
-// fix you are relying on. Caught when a peer enqueued --ref d7ab0d01a, saw the
-// enqueue echo it back correctly, and then saw this column claim 635ee5063.
-func shortJobRef(j *core.Job) string {
+// shortJobRef prefers the tested ref, preserving compatibility with older records.
+func shortJobRef(j api.Job) string {
 	ref := strings.TrimSpace(j.Ref)
 	if ref == "" {
 		ref = strings.TrimSpace(j.CommitSHA)
@@ -720,6 +735,9 @@ const daemonDownNote = "\n\n> ⚠️ The PushGuard daemon is not running. This c
 // NewLocalRunner creates its directory and a read must not.
 func readJobLog(jobID string) string {
 	base := os.Getenv("PUSHGUARD_LOG_DIR")
+	if base == "" && os.Getenv("PUSHGUARD_STATE_DIR") != "" {
+		base = filepath.Join(os.Getenv("PUSHGUARD_STATE_DIR"), "logs")
+	}
 	if base == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -732,4 +750,28 @@ func readJobLog(jobID string) string {
 		return ""
 	}
 	return string(data)
+}
+
+func secondsArgument(args map[string]any, key string, fallback int) (time.Duration, error) {
+	value, exists := args[key]
+	if !exists {
+		return time.Duration(fallback) * time.Second, nil
+	}
+	seconds, ok := value.(float64)
+	if !ok || seconds <= 0 || math.Trunc(seconds) != seconds || seconds > float64(math.MaxInt64/int64(time.Second)) {
+		return 0, fmt.Errorf("%s must be positive integer seconds", key)
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+func (s *Server) await(ctx context.Context, id string) (*api.Job, error) {
+	if _, ok := s.localJob(id); ok {
+		job, err := s.engine.AwaitJob(ctx, id, 100*time.Millisecond)
+		if err != nil {
+			return nil, err
+		}
+		result := application.Snapshot(job)
+		return &result, nil
+	}
+	return s.client.Await(ctx, id)
 }

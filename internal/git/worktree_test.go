@@ -93,6 +93,17 @@ func TestWorktreePruneOrphaned(t *testing.T) {
 
 	wm, _ := NewWorktreeManager(worktreeBase)
 
+	repo := setupTestGitRepo(t)
+	defer os.RemoveAll(repo)
+	active, err := wm.CreateWorktree(repo, "pg_active_1", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered, err := wm.CreateWorktree(repo, "pg_registered", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unknown directories must survive cleanup.
 	// Create fake orphaned folder
 	orphanDir := filepath.Join(worktreeBase, "pg_orphan_123")
 	_ = os.Mkdir(orphanDir, 0755)
@@ -105,8 +116,14 @@ func TestWorktreePruneOrphaned(t *testing.T) {
 		t.Errorf("expected 1 pruned folder, got %d", pruned)
 	}
 
-	if _, err := os.Stat(orphanDir); !os.IsNotExist(err) {
-		t.Errorf("expected orphanDir to be deleted")
+	if _, err := os.Stat(active); err != nil {
+		t.Fatalf("active worktree was removed: %v", err)
+	}
+	if _, err := os.Stat(registered); !os.IsNotExist(err) {
+		t.Error("registered stale worktree was not deleted")
+	}
+	if _, err := os.Stat(orphanDir); err != nil {
+		t.Errorf("unknown orphanDir must be preserved: %v", err)
 	}
 }
 
