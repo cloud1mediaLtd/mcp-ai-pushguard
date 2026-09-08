@@ -346,3 +346,42 @@ func TestExitCodesAreDistinct(t *testing.T) {
 		seen[code] = name
 	}
 }
+
+// The verdict must be the LAST thing await prints.
+//
+// An agent's harness reports the exit status of the whole shell command, so
+// `await ... ; echo done` or `await ... | tail -20` reports 0 for a red gate.
+// The reader then falls back on the output — and the output ended in screens of
+// test-failure noise with the single FAILED line scrolled off the top. Two
+// sessions each misread a red gate as green in one evening on exactly that.
+func TestAwaitPrintsTheVerdictLast(t *testing.T) {
+	home := t.TempDir()
+	seedJobRecord(t, home, "pg_verdict01", "failed", 2)
+
+	// No daemon: await answers from the mirrored record, which is the path a
+	// caller hits after the daemon idles out.
+	stdout, _, _ := runInHome(t, home, "await", "pg_verdict01", "--timeout", "1")
+
+	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
+	last := lines[len(lines)-1]
+	if !strings.Contains(last, "GATE FAILED") {
+		t.Fatalf("the final line must carry the verdict, got %q\nfull output:\n%s", last, stdout)
+	}
+	if !strings.Contains(last, "pg_verdict01") {
+		t.Fatalf("the verdict line must name the job, got %q", last)
+	}
+}
+
+func TestAwaitVerdictLineNamesAPass(t *testing.T) {
+	home := t.TempDir()
+	seedJobRecord(t, home, "pg_verdict02", "passed", 0)
+
+	stdout, _, code := runInHome(t, home, "await", "pg_verdict02", "--timeout", "1")
+	if code != 0 {
+		t.Fatalf("a passing gate must exit 0, got %d", code)
+	}
+	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
+	if last := lines[len(lines)-1]; !strings.Contains(last, "GATE PASSED") {
+		t.Fatalf("the final line must carry the verdict, got %q", last)
+	}
+}

@@ -414,8 +414,29 @@ func handleAwait(args []string) {
 
 	c := client.New("")
 	if !c.IsDaemonRunning() {
-		fmt.Fprintln(os.Stderr, "PushGuard daemon is not running.")
-		os.Exit(1)
+		// Refusing at the door was wrong whenever the answer is already on
+		// disk: the daemon idles out thirty minutes after the queue empties,
+		// which is routinely AFTER the job being waited on finished. status
+		// and list both read the mirrored record; await refused, which made
+		// "the daemon went away" look like "your result is gone".
+		//
+		// A job still recorded as queued or running is a different matter --
+		// no daemon means nothing is going to advance it, so waiting would
+		// hang until the timeout for an answer that can never come.
+		stored, err := store.OpenReadOnly().Get(jobID)
+		if err != nil || !stored.IsFinished() {
+			fmt.Fprintln(os.Stderr, "PushGuard daemon is not running.")
+			if err == nil {
+				fmt.Fprintf(os.Stderr, "Job %s is recorded as %s and nothing is running it. Re-enqueue it.\n", jobID, stored.Status)
+				os.Exit(exitJobNoVerdict)
+			}
+			os.Exit(1)
+		}
+		reportFinishedJob(stored, readJobLog(jobID))
+		if stored.Status != core.StatusPassed {
+			os.Exit(exitCodeFor(stored))
+		}
+		return
 	}
 
 	deadline := time.Now().Add(time.Duration(*timeoutSec) * time.Second)
@@ -436,13 +457,8 @@ func handleAwait(args []string) {
 			}
 		}
 		if job.IsFinished() {
-			fmt.Printf("%s (exit %d) in %s\n", strings.ToUpper(string(job.Status)), job.ExitCode, job.DurationString())
-			if logs, err := c.GetLogs(jobID, 400); err == nil {
-				if failure := core.ExtractFailure(logs, 30); failure != "" {
-					fmt.Println("\n--- Why it failed ---")
-					fmt.Println(failure)
-				}
-			}
+			logs, _ := c.GetLogs(jobID, 400)
+			reportFinishedJob(job, logs)
 			// Exit non-zero on a red job so a shell caller can branch on it,
 			// and give "no verdict" its own code so it cannot read as either.
 			if job.Status != core.StatusPassed {
@@ -935,4 +951,29 @@ func exitCodeFor(job *core.Job) int {
 	default:
 		return exitJobFailed
 	}
+}
+
+// reportFinishedJob prints a finished job's verdict, its failure excerpt, and
+// then the verdict AGAIN as the final line.
+//
+// The repetition is deliberate. An agent's harness reports the exit status of
+// the whole shell command, so `await ... ; echo done` or `await ... | tail -20`
+// reports 0 for a red gate -- the trailing command's status replaces await's.
+// The reader then falls back on the output, and the output used to end in
+// several screens of "--- Why it failed ---" test noise with the single FAILED
+// line scrolled off the top. Two sessions each misread a red gate as green in
+// one evening on exactly that.
+//
+// A terminal verdict line means a tailed, truncated or piped read still ends on
+// the answer. One line, and it closes the gap the exit code alone could not.
+func reportFinishedJob(job *core.Job, logs string) {
+	fmt.Printf("%s (exit %d) in %s\n", strings.ToUpper(string(job.Status)), job.ExitCode, job.DurationString())
+	if logs != "" {
+		if failure := core.ExtractFailure(logs, 30); failure != "" {
+			fmt.Println("\n--- Why it failed ---")
+			fmt.Println(failure)
+		}
+	}
+	fmt.Printf("\n=== GATE %s === job %s exited %d\n",
+		strings.ToUpper(string(job.Status)), job.ID, exitCodeFor(job))
 }
