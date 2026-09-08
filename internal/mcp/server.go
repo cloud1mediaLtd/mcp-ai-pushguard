@@ -489,7 +489,13 @@ func (s *Server) toolStatus(out io.Writer, id any, args map[string]any) {
 		// Answer "why did it fail" before "what did it print". Everything
 		// below this line is context; this line is the result.
 		if failure := core.ExtractFailure(logs, 30); failure != "" {
-			msg += fmt.Sprintf("\n**Why it failed**:\n```text\n%s\n```\n", failure)
+			// Name every failing test first: the excerpt below is a bounded
+			// window that drops from the front, so on a multi-failure run it
+			// shows the last of them and says nothing about the rest.
+			if names := core.FailureNames(logs); len(names) > 0 {
+				msg += fmt.Sprintf("\n**%d failing test(s)**: %s\n", len(names), strings.Join(names, ", "))
+			}
+			msg += fmt.Sprintf("\n**Why it failed** (excerpt; read the full log for the rest):\n```text\n%s\n```\n", failure)
 		}
 		msg += fmt.Sprintf("\n**Recent Logs (last %d lines)**:\n```text\n%s\n```", logLines, tailLines(logs, logLines))
 	}

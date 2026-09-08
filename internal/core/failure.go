@@ -100,3 +100,35 @@ func sortInts(values []int) {
 		}
 	}
 }
+
+// namedFailure matches the header line of one Go test failure.
+var namedFailure = regexp.MustCompile(`(?m)^\s*--- FAIL: (\S+)`)
+
+// FailureNames lists every distinct failing test in a log, in order.
+//
+// ExtractFailure returns a bounded WINDOW — it drops from the front once the
+// line budget is spent, so the last failure always survives and earlier ones
+// silently do not. That is the right trade for a screenful of output and the
+// wrong one for "what broke", and nothing said which had happened.
+//
+// It cost a real hour: two agents read the same failed job through
+// `pushguard status`, one reported three failures and the other four, and the
+// log actually held five. Each had a different subset and each believed it was
+// the whole. A summary that can omit items must say that it did.
+func FailureNames(logs string) []string {
+	seen := map[string]bool{}
+	names := make([]string, 0, 4)
+	for _, m := range namedFailure.FindAllStringSubmatch(logs, -1) {
+		// Subtests report as Parent/Child; the parent line is enough.
+		name := m[1]
+		if i := strings.Index(name, "/"); i > 0 {
+			name = name[:i]
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	return names
+}

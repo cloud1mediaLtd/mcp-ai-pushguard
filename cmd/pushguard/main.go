@@ -273,7 +273,10 @@ func handleStatus(args []string) {
 	// of "ok" and a handful that matter, and the tail is whatever finished
 	// last -- which is rarely the thing that broke.
 	if failure := core.ExtractFailure(logs, 30); failure != "" {
-		fmt.Println("\n--- Why it failed ---")
+		if names := core.FailureNames(logs); len(names) > 0 {
+			fmt.Printf("\n--- %d failing test(s): %s\n", len(names), strings.Join(names, ", "))
+		}
+		fmt.Println("\n--- Why it failed (excerpt; read the full log for the rest) ---")
 		fmt.Println(failure)
 	}
 	fmt.Println("\n--- Logs (last 40 lines) ---")
@@ -820,7 +823,10 @@ func statusFromDisk(jobID string) {
 		return
 	}
 	if failure := core.ExtractFailure(logs, 30); failure != "" {
-		fmt.Println("\n--- Why it failed ---")
+		if names := core.FailureNames(logs); len(names) > 0 {
+			fmt.Printf("\n--- %d failing test(s): %s\n", len(names), strings.Join(names, ", "))
+		}
+		fmt.Println("\n--- Why it failed (excerpt; read the full log for the rest) ---")
 		fmt.Println(failure)
 	}
 	fmt.Println("\n--- Logs (last 40 lines) ---")
@@ -936,8 +942,16 @@ func reportFinishedJob(job api.Job, logs string) {
 	printProvenance(job)
 	fmt.Printf("%s (exit %d) in %s\n", strings.ToUpper(string(job.Status)), job.ExitCode, job.DurationString())
 	if logs != "" {
+		// Name every failing test before showing the excerpt. ExtractFailure is
+		// a bounded window that drops from the front, so on a run with several
+		// failures it shows the last of them and says nothing about the rest —
+		// two readers of one job once came away with different subsets, each
+		// believing they had the whole.
+		if names := core.FailureNames(logs); len(names) > 0 {
+			fmt.Printf("\n--- %d failing test(s): %s\n", len(names), strings.Join(names, ", "))
+		}
 		if failure := core.ExtractFailure(logs, 30); failure != "" {
-			fmt.Println("\n--- Why it failed ---")
+			fmt.Println("\n--- Why it failed (excerpt; read the full log for the rest) ---")
 			fmt.Println(failure)
 		}
 	}

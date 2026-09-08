@@ -134,3 +134,61 @@ func TestExtractFailurePrefersACodeFailureOverAToolError(t *testing.T) {
 		t.Fatalf("a real test failure must outrank a tool error:\n%s", got)
 	}
 }
+
+// The regression this exists for: two agents read one failed job through
+// `pushguard status`, reported three failures and four respectively, and the
+// log held five. ExtractFailure is a bounded window that drops from the front,
+// so each saw a different subset and each believed it was complete.
+func TestFailureNamesListsEveryFailure(t *testing.T) {
+	logs := strings.Join([]string{
+		"--- FAIL: TestAuthorizationReviewInventory (0.00s)",
+		"    authorization_test.go:46: inventory changed",
+		"--- FAIL: TestEveryRoutingModuleIsCatalogued (0.00s)",
+		"--- FAIL: TestInternalImportAliasesDoNotGrow (0.12s)",
+		"--- FAIL: TestMutatingOpsDeclareIdempotency (0.00s)",
+		"--- FAIL: TestRawEndpointInventoryDoesNotGrow (0.08s)",
+	}, "\n")
+
+	got := FailureNames(logs)
+	want := []string{
+		"TestAuthorizationReviewInventory", "TestEveryRoutingModuleIsCatalogued",
+		"TestInternalImportAliasesDoNotGrow", "TestMutatingOpsDeclareIdempotency",
+		"TestRawEndpointInventoryDoesNotGrow",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("named %d failures, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("failure %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// A long log must not lose earlier failures the way the excerpt does.
+func TestFailureNamesSurvivesALogLongerThanTheExcerpt(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("--- FAIL: TestFirst (0.00s)\n")
+	for range 200 {
+		b.WriteString("some other output line\n")
+	}
+	b.WriteString("--- FAIL: TestLast (0.00s)\n")
+
+	got := FailureNames(b.String())
+	if len(got) != 2 || got[0] != "TestFirst" || got[1] != "TestLast" {
+		t.Fatalf("expected both failures across a long log, got %v", got)
+	}
+	// The excerpt genuinely cannot show both — which is why the names exist.
+	if excerpt := ExtractFailure(b.String(), 30); strings.Contains(excerpt, "TestFirst") {
+		t.Log("excerpt happened to include the first failure; the names are still the reliable list")
+	}
+}
+
+// Subtests belong to their parent; five subtest failures of one test are one
+// broken test, not five.
+func TestFailureNamesCollapsesSubtests(t *testing.T) {
+	logs := "--- FAIL: TestParent (0.00s)\n    --- FAIL: TestParent/case_one (0.00s)\n    --- FAIL: TestParent/case_two (0.00s)\n"
+	if got := FailureNames(logs); len(got) != 1 || got[0] != "TestParent" {
+		t.Fatalf("expected one parent failure, got %v", got)
+	}
+}
