@@ -69,6 +69,23 @@ suffix and a widely spread smoke-port slot from `PUSHGUARD_JOB_ID`; ports are
 still not reserved, so leave concurrency at one unless the gate itself can
 coordinate its external resources.
 
+Concurrency is read from `~/.pushguard/concurrency`, with
+`PUSHGUARD_CONCURRENCY` as an override and 1 as the default. A malformed or
+non-positive value in either falls through to the next source rather than
+becoming a large number: serialising is always correct and merely slower.
+
+Set it in the FILE, not the environment. Auto-spawn inherits the environment of
+whichever caller happens to wake the daemon, and the daemon idles out after
+about thirty minutes — so an export gives you the raise until the queue goes
+quiet, after which the next enqueue from a session without it silently returns
+to one. The file is beside the socket, the jobs and the logs because the
+setting belongs to the machine's queue rather than to one terminal.
+
+Installing a new binary does not change a running daemon; it takes effect at
+the next start. Never restart while anything is queued or running — an
+interrupted job leaves its worktree behind, and a c1m-server worktree is about
+900MB.
+
 ## Tools and authority
 
 MCP tools: `pushguard_enqueue`, `pushguard_status`, `pushguard_list`,
