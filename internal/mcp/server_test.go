@@ -166,3 +166,115 @@ func initTempGitRepoForMCPTest(t *testing.T) string {
 	}
 	return dir
 }
+
+// seedMirroredJob writes one job record into $HOME/.pushguard/jobs, the way
+// DurableStore.persist does inside the daemon.
+func seedMirroredJob(t *testing.T, home, id, status string) {
+	t.Helper()
+	dir := filepath.Join(home, ".pushguard", "jobs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := fmt.Sprintf(`{"id":%q,"name":"c1m-server","status":%q,"repo_path":"/repo/c1m-server",`+
+		`"branch":"main","ref":"d7ab0d01abcdef","command":["make","pre-push"],"exit_code":0,`+
+		`"created_at":"2026-09-07T10:00:00Z","started_at":"2026-09-07T10:00:01Z","finished_at":"2026-09-07T10:11:00Z"}`,
+		id, status)
+	if err := os.WriteFile(filepath.Join(dir, id+".json"), []byte(record), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func callTool(t *testing.T, server *Server, call string) map[string]any {
+	t.Helper()
+	var out bytes.Buffer
+	if err := server.Serve(strings.NewReader(call+"\n"), &out); err != nil {
+		t.Fatalf("Serve errored: %v", err)
+	}
+	var resp JSONRPCResponse
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &resp); err != nil {
+		t.Fatalf("decode: %v\nraw: %s", err, out.String())
+	}
+	result, ok := resp.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("expected a tool result, got: %v", resp)
+	}
+	return result
+}
+
+func toolText(t *testing.T, result map[string]any) string {
+	t.Helper()
+	content, _ := result["content"].([]any)
+	var sb strings.Builder
+	for _, c := range content {
+		if m, ok := c.(map[string]any); ok {
+			if s, ok := m["text"].(string); ok {
+				sb.WriteString(s)
+			}
+		}
+	}
+	return sb.String()
+}
+
+// The queue is shared between agents. With the daemon idled out, the embedded
+// fallback engine knows only jobs THIS process ran — so pushguard_list reported
+// "No recent PushGuard jobs found", which is not "I cannot see the queue" but a
+// positive claim that it is empty. An agent believing it starts work another
+// agent is already gating.
+func TestMCPServer_ListReadsMirroredRecordsWhenDaemonIsDown(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	seedMirroredJob(t, home, "pg_mirrored1", "passed")
+
+	server := newServerWithClient(client.New(filepath.Join(home, "nonexistent.sock")))
+	text := toolText(t, callTool(t, server,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pushguard_list","arguments":{}}}`))
+
+	if !strings.Contains(text, "pg_mirrored1") {
+		t.Fatalf("expected the mirrored job in the listing, got %q", text)
+	}
+	if strings.Contains(text, "No recent PushGuard jobs found") {
+		t.Fatalf("claimed the queue was empty while records existed on disk: %q", text)
+	}
+	if !strings.Contains(text, "daemon is not running") {
+		t.Fatalf("expected the answer to say it came from disk, got %q", text)
+	}
+}
+
+// Same defect on the single-job path: "job not found" is indistinguishable
+// from a typo'd id, and sends the caller looking for a bug in their own command
+// rather than collecting a result that is sitting on disk.
+func TestMCPServer_StatusReadsMirroredRecordWhenDaemonIsDown(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	seedMirroredJob(t, home, "pg_mirrored2", "failed")
+
+	server := newServerWithClient(client.New(filepath.Join(home, "nonexistent.sock")))
+	result := callTool(t, server,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pushguard_status","arguments":{"job_id":"pg_mirrored2"}}}`)
+
+	if isErr, _ := result["isError"].(bool); isErr {
+		t.Fatalf("expected the stored record to answer, got an error result: %v", result)
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, "pg_mirrored2") || !strings.Contains(text, "FAILED") {
+		t.Fatalf("expected the stored record's id and status, got %q", text)
+	}
+	if !strings.Contains(text, "daemon is not running") {
+		t.Fatalf("expected the answer to say it came from disk, got %q", text)
+	}
+}
+
+// An unknown id must still be an error. Falling back to disk must not turn
+// "no such job" into a confident empty answer.
+func TestMCPServer_StatusStillErrorsForUnknownJobWithDaemonDown(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	server := newServerWithClient(client.New(filepath.Join(home, "nonexistent.sock")))
+	result := callTool(t, server,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pushguard_status","arguments":{"job_id":"pg_nosuchjob"}}}`)
+
+	if isErr, _ := result["isError"].(bool); !isErr {
+		t.Fatalf("expected an error result for an unknown job, got %v", result)
+	}
+}

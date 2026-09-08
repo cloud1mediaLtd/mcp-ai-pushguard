@@ -243,8 +243,8 @@ func handleStatus(args []string) {
 	c := client.New("")
 
 	if !c.IsDaemonRunning() {
-		fmt.Fprintln(os.Stderr, "PushGuard daemon is not running.")
-		os.Exit(1)
+		statusFromDisk(jobID)
+		return
 	}
 
 	job, err := c.GetJob(jobID)
@@ -293,8 +293,8 @@ func tailLines(s string, n int) string {
 func handleList(args []string) {
 	c := client.New("")
 	if !c.IsDaemonRunning() {
-		fmt.Fprintln(os.Stderr, "PushGuard daemon is not running.")
-		os.Exit(1)
+		listFromDisk()
+		return
 	}
 
 	jobs, err := c.ListJobs(30)
@@ -312,7 +312,13 @@ func handleList(args []string) {
 	// the questions a second agent actually has are "what is running", "what is
 	// ahead of mine", and only then "what happened recently".
 	core.SortForQueueView(jobs)
+	renderJobTable(jobs)
+}
 
+// renderJobTable prints the queue view. Split out of handleList so the
+// offline path below renders identically -- a second table that drifted from
+// this one would be worse than no offline listing at all.
+func renderJobTable(jobs []*core.Job) {
 	fmt.Printf("%-14s %-10s %-4s %-10s %-24s %-10s %s\n", "JOB ID", "STATUS", "POS", "REF", "REPOSITORY", "DURATION", "COMMAND")
 	fmt.Println(strings.Repeat("-", 108))
 	position := 0
@@ -503,13 +509,7 @@ func worktreeBaseDir() string {
 	return filepath.Join(home, ".cache", "pushguard", "worktrees")
 }
 
-func daemonJobDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".pushguard", "jobs")
-}
+func daemonJobDir() string { return store.DefaultJobDir() }
 
 // defaultRedisAddr lets PUSHGUARD_REDIS_ADDR override the standard local
 // Redis address without requiring the --redis-addr flag on every invocation
@@ -783,4 +783,106 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max-3] + "..."
+}
+
+// offlineStore opens the daemon's mirrored job records for the CLI paths that
+// must still answer when no daemon is up. It wraps a throwaway memory store:
+// nothing on this path writes.
+func offlineStore() *store.DurableStore { return store.OpenReadOnly() }
+
+// offlineBanner is printed to stderr, not stdout, so it never lands in the
+// middle of output something else is parsing.
+//
+// The wording matters. A record mirrored while a job was queued or running
+// keeps that status forever if the daemon died mid-flight, and reading
+// "RUNNING" off a stopped daemon would send someone waiting for a result that
+// is never coming. Recovery only rewrites those records when a daemon next
+// starts (DurableStore.RecoverOrphans), which is exactly the moment this path
+// is not taken.
+func offlineBanner() {
+	fmt.Fprintln(os.Stderr, "PushGuard daemon is not running — reading stored records from disk.")
+	fmt.Fprintln(os.Stderr, "A job shown as QUEUED or RUNNING is not running now; it did not finish. Re-enqueue it.")
+}
+
+// statusFromDisk answers `pushguard status` with no daemon up.
+//
+// The daemon idles out after thirty minutes with an empty queue, which is
+// routine rather than exceptional -- and "enqueue, then walk away" means the
+// caller is, by design, back later. Refusing outright turned a stored result
+// into "daemon is not running", which reads as a fault to fix rather than an
+// answer to collect; a real session lost two gate results to that.
+//
+// Logs are read straight from the runner's log directory, so a failed gate
+// still explains itself here. That is the whole reason to come back.
+func statusFromDisk(jobID string) {
+	job, err := offlineStore().Get(jobID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "PushGuard daemon is not running, and there is no stored record for %s.\n", jobID)
+		fmt.Fprintln(os.Stderr, "Records are pruned 48 hours after a job finishes; start the daemon with `pushguard daemon` for live jobs.")
+		os.Exit(1)
+	}
+	offlineBanner()
+	fmt.Println()
+
+	fmt.Printf("Job:      %s\n", job.ID)
+	fmt.Printf("Status:   %s\n", strings.ToUpper(string(job.Status)))
+	fmt.Printf("Repo:     %s\n", job.RepoPath)
+	fmt.Printf("Branch:   %s\n", job.Branch)
+	fmt.Printf("Ref:      %s\n", shortRef(job))
+	fmt.Printf("Command:  %s\n", strings.Join(job.Command, " "))
+	fmt.Printf("Duration: %s\n", job.DurationString())
+	if job.ExitCode != 0 {
+		fmt.Printf("Exit:     %d\n", job.ExitCode)
+	}
+	if job.Error != "" {
+		fmt.Printf("Error:    %s\n", job.Error)
+	}
+
+	logs := readJobLog(job.ID)
+	if logs == "" {
+		return
+	}
+	if failure := core.ExtractFailure(logs, 30); failure != "" {
+		fmt.Println("\n--- Why it failed ---")
+		fmt.Println(failure)
+	}
+	fmt.Println("\n--- Logs (last 40 lines) ---")
+	fmt.Println(tailLines(logs, 40))
+}
+
+// readJobLog reads a job's log file directly. The runner's default location is
+// duplicated rather than shared because the runner creates its directory on
+// construction, and a read-only status call must not.
+func readJobLog(jobID string) string {
+	base := os.Getenv("PUSHGUARD_LOG_DIR")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		base = filepath.Join(home, ".cache", "pushguard", "logs")
+	}
+	data, err := os.ReadFile(filepath.Join(base, jobID+".log"))
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// listFromDisk answers `pushguard list` with no daemon up.
+//
+// An empty directory still exits 1: with nothing to show and no daemon, "the
+// daemon is down" is the only true answer, and printing an empty table would
+// claim the queue is empty when it is merely unreadable.
+func listFromDisk() {
+	jobs := offlineStore().ListFromDisk(30)
+	if len(jobs) == 0 {
+		fmt.Fprintln(os.Stderr, "PushGuard daemon is not running, and no stored job records were found.")
+		fmt.Fprintln(os.Stderr, "Start it with `pushguard daemon` (or `make pushguard-start`).")
+		os.Exit(1)
+	}
+	offlineBanner()
+	fmt.Println()
+	core.SortForQueueView(jobs)
+	renderJobTable(jobs)
 }

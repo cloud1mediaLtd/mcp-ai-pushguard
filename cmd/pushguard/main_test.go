@@ -160,3 +160,141 @@ func TestCLI_HookInstallRequiresSubcommand(t *testing.T) {
 		t.Fatalf("expected a usage message, got %q", stderr)
 	}
 }
+
+// runInHome is run() with a caller-supplied $HOME, so a test can seed
+// ~/.pushguard/jobs before invoking the binary.
+func runInHome(t *testing.T, home string, args ...string) (stdout, stderr string, exitCode int) {
+	t.Helper()
+	cmd := exec.Command(binaryPath(t), args...)
+	cmd.Env = append(os.Environ(), "HOME="+home, "PUSHGUARD_NO_AUTOSPAWN=1")
+
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+
+	code := 0
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		code = exitErr.ExitCode()
+	} else if err != nil {
+		t.Fatalf("failed to run binary: %v", err)
+	}
+	return outBuf.String(), errBuf.String(), code
+}
+
+// seedJobRecord writes one mirrored job record the way DurableStore.persist
+// does. Hand-rolled JSON rather than marshalling core.Job, so the test pins the
+// on-disk shape the CLI has to read rather than agreeing with the writer by
+// construction.
+func seedJobRecord(t *testing.T, home, id, status string, exitCode int) {
+	t.Helper()
+	dir := filepath.Join(home, ".pushguard", "jobs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir jobs dir: %v", err)
+	}
+	record := fmt.Sprintf(`{
+		"id": %q,
+		"name": "c1m-server",
+		"status": %q,
+		"repo_path": "/repo/c1m-server",
+		"branch": "main",
+		"ref": "d7ab0d01abcdef",
+		"commit_sha": "635ee5063abcdef",
+		"command": ["make", "pre-push"],
+		"exit_code": %d,
+		"created_at": "2026-09-07T10:00:00Z",
+		"started_at": "2026-09-07T10:00:01Z",
+		"finished_at": "2026-09-07T10:11:00Z"
+	}`, id, status, exitCode)
+	if err := os.WriteFile(filepath.Join(dir, id+".json"), []byte(record), 0o644); err != nil {
+		t.Fatalf("write job record: %v", err)
+	}
+}
+
+// The regression this whole path exists for: the daemon idles out after thirty
+// minutes, which is normal, and a caller who enqueued and walked away came back
+// to "daemon is not running" with their result sitting on disk unread.
+func TestCLI_StatusReadsStoredRecordWithoutDaemon(t *testing.T) {
+	home := t.TempDir()
+	seedJobRecord(t, home, "pg_stored01", "passed", 0)
+
+	stdout, stderr, code := runInHome(t, home, "status", "pg_stored01")
+	if code != 0 {
+		t.Fatalf("expected exit 0 for a stored passing job, got %d (stderr=%q)", code, stderr)
+	}
+	if !strings.Contains(stdout, "pg_stored01") || !strings.Contains(stdout, "PASSED") {
+		t.Fatalf("expected the stored record in stdout, got %q", stdout)
+	}
+	// The banner belongs on stderr so it never corrupts parsed stdout.
+	if !strings.Contains(stderr, "reading stored records from disk") {
+		t.Fatalf("expected an offline banner on stderr, got %q", stderr)
+	}
+	if strings.Contains(stdout, "reading stored records from disk") {
+		t.Fatalf("banner leaked into stdout: %q", stdout)
+	}
+}
+
+// `status` reports; `await` gates. The daemon-backed status exits 0 whatever
+// the job did, and the offline path must match it exactly: the same command
+// against the same job must not change its exit code depending on whether a
+// daemon happened to still be up. A caller that needs the verdict in $? uses
+// `await`, which does propagate it.
+func TestCLI_OfflineStatusExitCodeMatchesOnlineContract(t *testing.T) {
+	for _, tc := range []struct {
+		id       string
+		status   string
+		exitCode int
+	}{
+		{"pg_stored02", "failed", 2},
+		{"pg_stored03", "cancelled", 0},
+	} {
+		home := t.TempDir()
+		seedJobRecord(t, home, tc.id, tc.status, tc.exitCode)
+
+		stdout, stderr, code := runInHome(t, home, "status", tc.id)
+		if code != 0 {
+			t.Fatalf("%s: status must exit 0 like the daemon-backed path, got %d", tc.status, code)
+		}
+		// It must still be unmistakable that the job did not pass.
+		if !strings.Contains(stdout, strings.ToUpper(tc.status)) {
+			t.Fatalf("%s: expected the status in the output, got %q (stderr=%q)", tc.status, stdout, stderr)
+		}
+	}
+}
+
+func TestCLI_ListReadsStoredRecordsWithoutDaemon(t *testing.T) {
+	home := t.TempDir()
+	seedJobRecord(t, home, "pg_stored04", "passed", 0)
+
+	stdout, stderr, code := runInHome(t, home, "list")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr=%q)", code, stderr)
+	}
+	if !strings.Contains(stdout, "pg_stored04") {
+		t.Fatalf("expected the stored job in the table, got %q", stdout)
+	}
+	// The REF column must show the gated commit, not the branch tip.
+	if !strings.Contains(stdout, "d7ab0d01a") {
+		t.Fatalf("expected the job's Ref in the REF column, got %q", stdout)
+	}
+	if strings.Contains(stdout, "635ee5063") {
+		t.Fatalf("REF column showed CommitSHA (the branch tip) instead of Ref: %q", stdout)
+	}
+}
+
+// Warn about a record that outlived its daemon: it says RUNNING but nothing is.
+func TestCLI_OfflineListWarnsThatInFlightRecordsAreNotRunning(t *testing.T) {
+	home := t.TempDir()
+	seedJobRecord(t, home, "pg_stored05", "running", 0)
+
+	stdout, stderr, code := runInHome(t, home, "list")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr=%q)", code, stderr)
+	}
+	if !strings.Contains(stdout, "pg_stored05") {
+		t.Fatalf("expected the stored job, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "is not running now") {
+		t.Fatalf("expected a warning that an in-flight record is stale, got %q", stderr)
+	}
+}

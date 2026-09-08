@@ -228,3 +228,67 @@ func (s *DurableStore) RecoverOrphans() []*core.Job {
 	sort.Slice(orphans, func(i, j int) bool { return orphans[i].CreatedAt.Before(orphans[j].CreatedAt) })
 	return orphans
 }
+
+// ListFromDisk reads every mirrored record and returns them newest-first,
+// capped at limit.
+//
+// List above delegates to the in-memory store, which is the right answer
+// inside the daemon and the wrong one everywhere else: a CLI process is not
+// the daemon, so its memory store is empty and `pushguard list` had nothing to
+// fall back on when the daemon was down. Combined with the idle shutdown —
+// which is routine, not exceptional — that meant "enqueue and walk away" could
+// come back half an hour later to "daemon is not running" with a jobs
+// directory full of the results being asked for.
+//
+// Get already falls through to disk; this is the same fallback for the
+// listing path.
+func (s *DurableStore) ListFromDisk(limit int) []*core.Job {
+	if s.dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil
+	}
+	var jobs []*core.Job
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		job, err := s.readFromDisk(strings.TrimSuffix(entry.Name(), ".json"))
+		if err != nil {
+			continue
+		}
+		jobs = append(jobs, job)
+	}
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.After(jobs[j].CreatedAt) })
+	if limit > 0 && len(jobs) > limit {
+		jobs = jobs[:limit]
+	}
+	return jobs
+}
+
+// DefaultJobDir is where job records are mirrored: ~/.pushguard/jobs, alongside
+// the socket, so the whole layout stays one place.
+//
+// It lives here rather than in the daemon's own package because the readers are
+// no longer only the daemon. The CLI and the MCP server both have to answer
+// "what happened to my job" with no daemon up, and each having its own idea of
+// where the records are is exactly how one of them ends up confidently
+// reporting an empty queue.
+func DefaultJobDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".pushguard", "jobs")
+}
+
+// OpenReadOnly opens the mirrored records for a process that only reads them.
+// The memory store it wraps is a throwaway: nothing on this path writes, and
+// in particular it must never share a store with an embedded engine that does
+// — a second writer against the daemon's directory is how a running job gets
+// recovered out from under itself.
+func OpenReadOnly() *DurableStore {
+	return &DurableStore{inner: NewMemoryStore(1), dir: DefaultJobDir()}
+}

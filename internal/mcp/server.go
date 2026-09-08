@@ -400,6 +400,7 @@ func (s *Server) toolStatus(out io.Writer, id any, args map[string]any) {
 	var job *core.Job
 	var logs string
 	var err error
+	var offlineNote string
 
 	if s.client.IsDaemonRunning() {
 		job, err = s.client.GetJob(jobID)
@@ -407,9 +408,18 @@ func (s *Server) toolStatus(out io.Writer, id any, args map[string]any) {
 			logs, _ = s.client.GetLogs(jobID, scanLines)
 		}
 	} else {
+		// The embedded engine only knows jobs THIS process ran. Everything the
+		// daemon ran before it idled out is invisible to it, so asking it about
+		// a job from an hour ago answers "not found" — indistinguishable from a
+		// typo'd id, and the reason a caller goes looking for a bug in their own
+		// command instead of collecting their result.
 		job, err = s.ensureEmbeddedEngine().GetJob(jobID)
 		if err == nil {
 			logs = job.TailLogs(scanLines)
+		} else if stored, storeErr := store.OpenReadOnly().Get(jobID); storeErr == nil {
+			job, err = stored, nil
+			logs = readJobLog(jobID)
+			offlineNote = daemonDownNote
 		}
 	}
 
@@ -436,7 +446,7 @@ func (s *Server) toolStatus(out io.Writer, id any, args map[string]any) {
 			"- **Command**: `%s`\n"+
 			"- **Duration**: %s\n",
 		job.ID, statusEmoji, strings.ToUpper(string(job.Status)), job.RepoPath, strings.Join(job.Command, " "), job.DurationString(),
-	)
+	) + offlineNote
 
 	if job.Error != "" {
 		msg += fmt.Sprintf("- **Error**: %s\n", job.Error)
@@ -465,10 +475,21 @@ func (s *Server) toolList(out io.Writer, id any, args map[string]any) {
 	var jobs []*core.Job
 	var err error
 
+	offlineNote := ""
 	if s.client.IsDaemonRunning() {
 		jobs, err = s.client.ListJobs(limit)
 	} else {
 		jobs = s.ensureEmbeddedEngine().ListJobs(limit)
+		if len(jobs) == 0 {
+			// Reporting "no recent jobs" from an empty in-process store is a
+			// false negative about SHARED state: several agents queue against
+			// one daemon, and an agent told the queue is empty will happily
+			// start work another agent is already gating.
+			jobs = store.OpenReadOnly().ListFromDisk(limit)
+			if len(jobs) > 0 {
+				offlineNote = daemonDownNote
+			}
+		}
 	}
 
 	if err != nil {
@@ -503,7 +524,7 @@ func (s *Server) toolList(out io.Writer, id any, args map[string]any) {
 		))
 	}
 
-	s.sendToolText(out, id, sb.String(), false)
+	s.sendToolText(out, id, sb.String()+offlineNote, false)
 }
 
 func (s *Server) toolCancel(out io.Writer, id any, args map[string]any) {
@@ -672,4 +693,34 @@ func shortJobRef(j *core.Job) string {
 		return ref[:9]
 	}
 	return ref
+}
+
+// daemonDownNote is appended to any answer assembled from mirrored records
+// rather than a live daemon.
+//
+// It has to say both halves. "The daemon is down" alone invites the reader to
+// treat the listing as complete history, when it is capped by the 48-hour
+// prune; and a record mirrored mid-flight keeps its QUEUED or RUNNING status
+// forever, because only a daemon start rewrites those. An agent that reads
+// RUNNING here and waits is waiting for nothing.
+const daemonDownNote = "\n\n> ⚠️ The PushGuard daemon is not running. This came from stored job records on disk, so nothing here is queued or running — a job shown as QUEUED or RUNNING did not finish and must be re-enqueued. Records are pruned 48 hours after a job finishes. Start the daemon with `make pushguard-start` to queue new work."
+
+// readJobLog reads a finished job's log file directly, for the paths that have
+// no daemon to ask and no in-process copy of the job. It duplicates the
+// runner's default location rather than constructing a runner, because
+// NewLocalRunner creates its directory and a read must not.
+func readJobLog(jobID string) string {
+	base := os.Getenv("PUSHGUARD_LOG_DIR")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		base = filepath.Join(home, ".cache", "pushguard", "logs")
+	}
+	data, err := os.ReadFile(filepath.Join(base, jobID+".log"))
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
