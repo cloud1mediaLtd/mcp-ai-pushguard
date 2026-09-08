@@ -90,7 +90,15 @@ func TestRecoverOrphansTurnsInterruptedJobsIntoAnExplicitReason(t *testing.T) {
 	}
 }
 
-func TestDurableStoreClearRemovesTheRecordsItDrops(t *testing.T) {
+// Clear evicts from memory only. It used to delete the on-disk record too, and
+// the combination destroyed the very thing this store exists for: idle shutdown
+// calls engine.Clean() -> Clear(), so half an hour after the queue emptied,
+// every completed job's record was gone and a caller who had walked away got
+// "job not found". A real session lost two gate results to it.
+//
+// PruneOld is the retention mechanism — age-based, and it never touches a
+// queued or running record. Keeping both meant keeping neither.
+func TestDurableStoreClearLeavesTheRecordOnDisk(t *testing.T) {
 	dir := t.TempDir()
 	s := NewDurable(NewMemoryStore(10), dir)
 
@@ -99,13 +107,21 @@ func TestDurableStoreClearRemovesTheRecordsItDrops(t *testing.T) {
 	_ = s.Save(done)
 	_ = s.Save(queuedJob("pg_open"))
 
-	s.Clear(true)
-
-	if _, err := NewDurable(NewMemoryStore(10), dir).Get("pg_done"); err == nil {
-		t.Error("a cleared job left its record behind; the directory would grow forever")
+	if dropped := s.Clear(true); dropped != 1 {
+		t.Fatalf("Clear(completedOnly) evicted %d from memory, want 1", dropped)
 	}
-	if _, err := NewDurable(NewMemoryStore(10), dir).Get("pg_open"); err != nil {
-		t.Error("clear(completedOnly) removed a job that had not completed")
+
+	// Gone from memory...
+	if _, err := s.inner.Get("pg_done"); err == nil {
+		t.Error("Clear did not evict the finished job from memory")
+	}
+	// ...but still answerable, which is the whole point.
+	fresh := NewDurable(NewMemoryStore(10), dir)
+	if _, err := fresh.Get("pg_done"); err != nil {
+		t.Error("a finished job's record was deleted by Clear; walking away for 30 minutes would lose the result")
+	}
+	if _, err := fresh.Get("pg_open"); err != nil {
+		t.Error("an unfinished job's record was removed")
 	}
 }
 

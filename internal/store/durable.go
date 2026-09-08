@@ -122,29 +122,22 @@ func (s *DurableStore) readFromDisk(id string) (*core.Job, error) {
 func (s *DurableStore) List(limit int) []*core.Job { return s.inner.List(limit) }
 func (s *DurableStore) Stats() MemoryStats         { return s.inner.Stats() }
 
-// Clear removes the records it drops from memory, so `pushguard clean` does not
-// leave the directory growing forever.
+// Clear evicts from memory only, delegating to the inner store.
+//
+// It used to delete the on-disk record of every job it dropped, so the
+// directory would not grow forever. PruneOld below already does that job
+// properly — age-based, 48 hours, and it never removes a queued or running
+// record — so the two together only destroyed history.
+//
+// Idle shutdown calls engine.Clean(), which calls Clear(). So half an hour
+// after the queue emptied, every completed job's record was gone and "enqueue
+// and walk away" came back to "job not found". A real session lost two gate
+// results to exactly that.
+//
+// Memory eviction and disk retention are separate concerns, and this is where
+// they separate.
 func (s *DurableStore) Clear(completedOnly bool) int {
-	before := map[string]bool{}
-	for _, job := range s.inner.List(0) {
-		if job != nil {
-			before[job.ID] = true
-		}
-	}
-	n := s.inner.Clear(completedOnly)
-	for _, job := range s.inner.List(0) {
-		if job != nil {
-			delete(before, job.ID)
-		}
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for id := range before {
-		if path := s.path(id); path != "" {
-			_ = os.Remove(path)
-		}
-	}
-	return n
+	return s.inner.Clear(completedOnly)
 }
 
 // PruneOld deletes on-disk records for jobs that finished more than maxAge
