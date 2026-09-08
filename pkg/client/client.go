@@ -244,3 +244,41 @@ func (c *Client) Clean() (*core.CleanReport, error) {
 	return result.Report, nil
 }
 
+// maxAutoConcurrency caps what the environment may ask for. A gate run is a
+// full build and test suite; past a handful in parallel they contend for CPU
+// and the shared Postgres server's connection limit, and every job gets slower
+// rather than the set finishing sooner.
+const maxAutoConcurrency = 8
+
+// DefaultConcurrency resolves how many gate workers a daemon should run, from
+// PUSHGUARD_CONCURRENCY, defaulting to 1.
+//
+// It exists because concurrency was, in practice, unconfigurable. Both
+// auto-spawn call sites passed a literal 1, and the daemon self-shuts-down
+// after ~30 idle minutes — so a daemon started by hand with --concurrency 3
+// reverted to 1 at the next idle window, permanently and silently. Three
+// agents sharing one queue therefore serialised every ~10-minute gate behind
+// every other, and it looked like a setting someone had forgotten rather than
+// one that could not be set.
+//
+// Raising it is only safe when concurrent jobs do not collide on resources
+// outside the git worktree PushGuard isolates for them — the shared test
+// database above all. PUSHGUARD_JOB_ID is exported into every job's
+// environment precisely so a caller's build can derive a unique name from it;
+// a repository whose gate does not do that should leave this at 1.
+func DefaultConcurrency() int {
+	raw := strings.TrimSpace(os.Getenv("PUSHGUARD_CONCURRENCY"))
+	if raw == "" {
+		return 1
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		// A malformed value must not silently become "lots". Serialising is
+		// always correct, just slower.
+		return 1
+	}
+	if n > maxAutoConcurrency {
+		return maxAutoConcurrency
+	}
+	return n
+}

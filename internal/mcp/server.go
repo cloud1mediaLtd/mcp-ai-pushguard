@@ -61,7 +61,7 @@ func NewServer() *Server {
 func newServerWithClient(c *client.Client) *Server {
 	s := &Server{client: c}
 
-	if err := c.EnsureDaemon(1); err != nil {
+	if err := c.EnsureDaemon(client.DefaultConcurrency()); err != nil {
 		// Auto-start failed (binary not locatable, spawn error, etc.) — fall
 		// back to an embedded engine scoped to this process only. stdout is
 		// the JSON-RPC channel, so this diagnostic goes to stderr only.

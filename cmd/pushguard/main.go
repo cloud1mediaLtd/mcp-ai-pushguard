@@ -140,7 +140,7 @@ func handleEnqueue(args []string) {
 
 	// Try to get (or auto-start) the shared daemon so this job coordinates
 	// with everything else on the machine instead of running in isolation.
-	if err := c.EnsureDaemon(1); err != nil {
+	if err := c.EnsureDaemon(client.DefaultConcurrency()); err != nil {
 		fmt.Fprintf(os.Stderr, "ℹ️  Could not start shared daemon (%s); running standalone.\n", err)
 	}
 
@@ -537,7 +537,10 @@ func handleDaemon(args []string) {
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
 	socketPath := fs.String("socket", daemon.DefaultSocketPath(), "Path to Unix socket")
 	httpAddr := fs.String("http", "", "Optional HTTP address to bind (e.g. 127.0.0.1:8942)")
-	concurrency := fs.Int("concurrency", 1, "Max concurrent test workers")
+	// Default from PUSHGUARD_CONCURRENCY so the value survives the daemon's
+	// idle-shutdown and the auto-respawn that follows it; an explicit flag
+	// still wins for a hand-started daemon.
+	concurrency := fs.Int("concurrency", client.DefaultConcurrency(), "Max concurrent test workers (default from PUSHGUARD_CONCURRENCY)")
 	idleMinutes := fs.Int("idle-shutdown-minutes", 30, "Self-shutdown after this many idle minutes with no jobs (0 disables)")
 	redisAddr := fs.String("redis-addr", defaultRedisAddr(), "Redis address for job-event pub/sub (empty disables); overridable via PUSHGUARD_REDIS_ADDR")
 	_ = fs.Parse(args)

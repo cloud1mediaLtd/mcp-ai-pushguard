@@ -131,3 +131,34 @@ func TestEnsureDaemon_RefusesToSpawnFromTestBinary(t *testing.T) {
 		t.Fatalf("expected an immediate refusal, not a poll/timeout loop; took %s", elapsed)
 	}
 }
+
+// Concurrency was unconfigurable in practice: both auto-spawn call sites passed
+// a literal 1, and the daemon's ~30-minute idle shutdown meant a hand-started
+// --concurrency 3 reverted to 1 at the next quiet window. Three agents on one
+// queue then serialised every ~10-minute gate behind every other.
+func TestDefaultConcurrency(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		want int
+	}{
+		{"unset serialises, as before", "", 1},
+		{"an explicit value is honoured", "3", 3},
+		{"one is still one", "1", 1},
+		// A malformed value must never become "lots": serialising is always
+		// correct, merely slower, whereas over-parallelising a gate collides on
+		// the shared test database.
+		{"garbage serialises", "lots", 1},
+		{"empty-ish serialises", "   ", 1},
+		{"zero serialises", "0", 1},
+		{"negative serialises", "-4", 1},
+		{"absurd values are capped", "500", 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PUSHGUARD_CONCURRENCY", tc.env)
+			if got := client.DefaultConcurrency(); got != tc.want {
+				t.Fatalf("PUSHGUARD_CONCURRENCY=%q gave %d, want %d", tc.env, got, tc.want)
+			}
+		})
+	}
+}
