@@ -591,8 +591,17 @@ func (s *Server) toolAwait(out io.Writer, id any, args map[string]any) {
 		return
 	}
 
+	// A cancelled job reports ExitCode 0 because no process ever returned one.
+	// Rendering "completed with status: cancelled (exit code 0)" put a zero in
+	// front of a reader whose next question is "did it pass" -- and "completed"
+	// is wrong too: nothing ran. Say that instead of showing a number that
+	// means nothing here.
 	resultText := fmt.Sprintf("Job `%s` completed with status: **%s** (exit code %d) in %s.",
 		job.ID, job.Status, job.ExitCode, job.DurationString())
+	if job.Status == core.StatusCancelled {
+		resultText = fmt.Sprintf("Job `%s` was **cancelled** after %s. No checks ran, so this is not a pass and not a failure — "+
+			"there is no verdict. Re-enqueue it if you still need the gate.", job.ID, job.DurationString())
+	}
 	s.sendToolText(out, id, resultText, job.Status != core.StatusPassed)
 }
 

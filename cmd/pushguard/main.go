@@ -230,7 +230,7 @@ func handleEnqueue(args []string) {
 	if finishedJob.Status != core.StatusPassed {
 		fmt.Println("\n--- Output Log Snippet ---")
 		fmt.Println(finishedJob.TailLogs(30))
-		os.Exit(finishedJob.ExitCode)
+		os.Exit(exitCodeFor(finishedJob))
 	}
 }
 
@@ -422,8 +422,18 @@ func handleAwait(args []string) {
 	for {
 		job, err := c.GetJob(jobID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %s\n", err)
-			os.Exit(1)
+			// The daemon can go away mid-wait (idle shutdown racing the last
+			// job, a crash, someone rebuilding). Its last mirrored record is
+			// still on disk and may well be the finished verdict we are here
+			// for, so read that before giving up.
+			if stored, storeErr := store.OpenReadOnly().Get(jobID); storeErr == nil && stored.IsFinished() {
+				job = stored
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+				// Not a failed gate: nothing was decided. Exiting 1 here would
+				// be indistinguishable from a red run.
+				os.Exit(exitJobNoVerdict)
+			}
 		}
 		if job.IsFinished() {
 			fmt.Printf("%s (exit %d) in %s\n", strings.ToUpper(string(job.Status)), job.ExitCode, job.DurationString())
@@ -433,15 +443,16 @@ func handleAwait(args []string) {
 					fmt.Println(failure)
 				}
 			}
-			// Exit non-zero on a red job so a shell caller can branch on it.
+			// Exit non-zero on a red job so a shell caller can branch on it,
+			// and give "no verdict" its own code so it cannot read as either.
 			if job.Status != core.StatusPassed {
-				os.Exit(1)
+				os.Exit(exitCodeFor(job))
 			}
 			return
 		}
 		if time.Now().After(deadline) {
 			fmt.Fprintf(os.Stderr, "Timed out after %ds; job %s is still %s.\n", *timeoutSec, jobID, job.Status)
-			os.Exit(2)
+			os.Exit(exitAwaitTimeout)
 		}
 		time.Sleep(5 * time.Second)
 	}
@@ -885,4 +896,40 @@ func listFromDisk() {
 	fmt.Println()
 	core.SortForQueueView(jobs)
 	renderJobTable(jobs)
+}
+
+// Exit codes for a finished job. Only a gate that actually passed exits 0.
+//
+//	0  passed
+//	1  failed — the checks ran and something was red
+//	2  timed out waiting (await only; the job may still be running)
+//	3  no verdict — cancelled, or orphaned by a daemon restart. Nothing ran.
+//
+// The third code is the point. A cancelled job records ExitCode 0 for the
+// mundane reason that no process ever returned one, and both `enqueue --wait`
+// and a daemon that vanished mid-await used to pass that straight through. A
+// shell caller branching on $?, or an agent reading the exit status, then read
+// an unrun gate as a clean one -- the worst possible direction for a tool whose
+// whole job is to say whether the checks passed. A peer nearly reported a gate
+// as green on exactly this, having cancelled it themselves seconds earlier.
+//
+// A failed job always exits 1 rather than forwarding the runner's own code,
+// which could otherwise collide with 2 or 3 and turn a red gate into "timed
+// out" or "never ran". The runner's exit code is printed in the output, where
+// it is unambiguous.
+const (
+	exitJobFailed    = 1
+	exitAwaitTimeout = 2
+	exitJobNoVerdict = 3
+)
+
+func exitCodeFor(job *core.Job) int {
+	switch job.Status {
+	case core.StatusPassed:
+		return 0
+	case core.StatusCancelled:
+		return exitJobNoVerdict
+	default:
+		return exitJobFailed
+	}
 }

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/pushguard/pushguard/internal/core"
 )
 
 // main() calls os.Exit() throughout, which makes it untestable in-process —
@@ -296,5 +298,51 @@ func TestCLI_OfflineListWarnsThatInFlightRecordsAreNotRunning(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "is not running now") {
 		t.Fatalf("expected a warning that an in-flight record is stale, got %q", stderr)
+	}
+}
+
+// The exit-code contract, pinned because the whole value of a gate runner is
+// that $? tells the truth about whether the checks passed.
+//
+// The dangerous case is a cancelled job: it records ExitCode 0 because no
+// process ever returned one, and passing that through reported an unrun gate
+// as a clean one. A peer nearly reported a gate as green having cancelled it
+// themselves seconds earlier.
+func TestExitCodeFor(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   core.JobStatus
+		exitCode int
+		want     int
+	}{
+		{"a passing gate is the only zero", core.StatusPassed, 0, 0},
+		{"a failed gate is 1", core.StatusFailed, 1, exitJobFailed},
+		{"a failed gate does not forward the runner's code", core.StatusFailed, 2, exitJobFailed},
+		{"a failed gate recording 0 is still a failure", core.StatusFailed, 0, exitJobFailed},
+		{"a cancelled gate never ran, so it is not a pass", core.StatusCancelled, 0, exitJobNoVerdict},
+		{"nor a failure", core.StatusCancelled, 1, exitJobNoVerdict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := exitCodeFor(&core.Job{Status: tc.status, ExitCode: tc.exitCode})
+			if got != tc.want {
+				t.Fatalf("exitCodeFor(%s, exit %d) = %d, want %d", tc.status, tc.exitCode, got, tc.want)
+			}
+		})
+	}
+}
+
+// The three non-zero codes must stay distinct, or "never ran" collapses back
+// into "failed" or "timed out" and the distinction above buys nothing.
+func TestExitCodesAreDistinct(t *testing.T) {
+	seen := map[int]string{0: "passed"}
+	for code, name := range map[int]string{
+		exitJobFailed:    "failed",
+		exitAwaitTimeout: "await timeout",
+		exitJobNoVerdict: "no verdict",
+	} {
+		if other, clash := seen[code]; clash {
+			t.Fatalf("%s and %s both exit %d", name, other, code)
+		}
+		seen[code] = name
 	}
 }
