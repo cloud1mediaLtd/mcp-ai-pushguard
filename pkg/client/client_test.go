@@ -156,10 +156,67 @@ func TestDefaultConcurrency(t *testing.T) {
 		{"absurd values are capped", "500", 8},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir()) // no config file in play for these cases
 			t.Setenv("PUSHGUARD_CONCURRENCY", tc.env)
 			if got := client.DefaultConcurrency(); got != tc.want {
 				t.Fatalf("PUSHGUARD_CONCURRENCY=%q gave %d, want %d", tc.env, got, tc.want)
 			}
 		})
 	}
+}
+
+// The environment variable alone could not hold a raise in place.
+//
+// Auto-spawn inherits the environment of whichever caller wakes the daemon, and
+// the daemon idles out after ~30 minutes. So one agent exporting
+// PUSHGUARD_CONCURRENCY=3 gets three workers until the queue goes quiet, after
+// which the next enqueue from a session without that export brings it back at
+// 1 — a setting that appears to work and then silently stops.
+func TestDefaultConcurrencyPersistsInAFile(t *testing.T) {
+	writeConfig := func(t *testing.T, body string) {
+		t.Helper()
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("PUSHGUARD_CONCURRENCY", "")
+		dir := filepath.Join(home, ".pushguard")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "concurrency"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("a stored value survives a caller with no environment set", func(t *testing.T) {
+		writeConfig(t, "3\n")
+		if got := client.DefaultConcurrency(); got != 3 {
+			t.Fatalf("stored concurrency = %d, want 3", got)
+		}
+	})
+
+	t.Run("the environment overrides the file", func(t *testing.T) {
+		writeConfig(t, "3")
+		t.Setenv("PUSHGUARD_CONCURRENCY", "2")
+		if got := client.DefaultConcurrency(); got != 2 {
+			t.Fatalf("env should win, got %d", got)
+		}
+	})
+
+	// Same rule as the environment: serialising is always correct, so a
+	// corrupt file must not become "lots".
+	for _, body := range []string{"lots", "0", "-4", "   "} {
+		t.Run("a malformed file serialises: "+body, func(t *testing.T) {
+			writeConfig(t, body)
+			if got := client.DefaultConcurrency(); got != 1 {
+				t.Fatalf("body %q gave %d, want 1", body, got)
+			}
+		})
+	}
+
+	t.Run("an absurd stored value is capped", func(t *testing.T) {
+		writeConfig(t, "500")
+		if got := client.DefaultConcurrency(); got != 8 {
+			t.Fatalf("capped concurrency = %d, want 8", got)
+		}
+	})
 }

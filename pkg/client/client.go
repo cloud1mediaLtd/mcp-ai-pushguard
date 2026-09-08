@@ -341,21 +341,50 @@ const maxAutoConcurrency = 8
 // database above all. PUSHGUARD_JOB_ID is exported into every job's
 // environment precisely so a caller's build can derive a unique name from it;
 // a repository whose gate does not do that should leave this at 1.
+//
+// The environment variable alone was not enough, and the reason is the same
+// idle-shutdown that made the flag useless. Auto-spawn inherits the
+// environment of whichever caller happens to wake the daemon — so one agent
+// exporting PUSHGUARD_CONCURRENCY=3 gets three workers until the queue empties
+// for thirty minutes, after which the next enqueue from a session without that
+// export silently brings the daemon back at 1. The setting would appear to
+// work and then quietly stop, which is worse than not having it.
+//
+// So the file is the durable answer and the variable is the override. Neither
+// requires editing a shell profile, which is the wrong place for a setting
+// that belongs to the machine's queue rather than to one person's terminal.
 func DefaultConcurrency() int {
-	raw := strings.TrimSpace(os.Getenv("PUSHGUARD_CONCURRENCY"))
-	if raw == "" {
-		return 1
+	if n, ok := parseConcurrency(os.Getenv("PUSHGUARD_CONCURRENCY")); ok {
+		return n
 	}
-	n, err := strconv.Atoi(raw)
+	if home, err := os.UserHomeDir(); err == nil {
+		if body, err := os.ReadFile(filepath.Join(home, ".pushguard", "concurrency")); err == nil {
+			if n, ok := parseConcurrency(string(body)); ok {
+				return n
+			}
+		}
+	}
+	return 1
+}
+
+// parseConcurrency reports a usable worker count, or false to fall through.
+//
+// A malformed value falls through rather than becoming "lots": serialising is
+// always correct and merely slower, whereas over-parallelising collides on the
+// shared test database. Empty is not an error — it is simply "not set here".
+func parseConcurrency(raw string) (int, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(trimmed)
 	if err != nil || n < 1 {
-		// A malformed value must not silently become "lots". Serialising is
-		// always correct, just slower.
-		return 1
+		return 0, false
 	}
 	if n > maxAutoConcurrency {
-		return maxAutoConcurrency
+		return maxAutoConcurrency, true
 	}
-	return n
+	return n, true
 }
 
 // ErrIncompatible indicates a live daemon that cannot safely accept this client's jobs.
