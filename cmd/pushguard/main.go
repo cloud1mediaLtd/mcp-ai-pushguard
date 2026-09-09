@@ -705,6 +705,15 @@ func runDaemon(args []string) int {
 					fmt.Printf("[pushguard] scheduled disk prune: worktrees pruned=%d, logs pruned=%d, job records pruned=%d\n",
 						worktreesPruned, logsPruned, jobRecordsPruned)
 				}
+				// Worktrees and logs are usually not where the space went. The
+				// Go build cache has no size limit and grew to 171 GB on
+				// 2026-09-09, filling a 926 GB volume and failing three gates
+				// with misattributed "[build failed]" errors. Reclaim it before
+				// the enqueue thresholds have to start refusing work.
+				if before, after, ran := engine.ReclaimDiskIfIdle(context.Background(), worktreeBaseDir()); ran {
+					fmt.Printf("[pushguard] reclaimed the Go build cache: %s free -> %s free\n",
+						core.HumanBytes(before), core.HumanBytes(after))
+				}
 			}
 		}
 	}()

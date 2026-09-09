@@ -517,6 +517,37 @@ func (e *Engine) PruneDiskArtifacts() (worktreesPruned, logsPruned int) {
 	return worktreesPruned, logsPruned
 }
 
+// idle reports whether no job is currently running.
+//
+// Extracted rather than inlined so it can be asserted directly: a test that
+// only checks ReclaimDiskIfIdle's return value cannot tell "skipped because
+// busy" apart from "skipped because there was disk space", and would pass with
+// the busy check deleted.
+func (e *Engine) idle() bool {
+	e.cancelsMu.Lock()
+	defer e.cancelsMu.Unlock()
+	return len(e.cancels) == 0
+}
+
+// ReclaimDiskIfIdle empties the Go build cache when free space has fallen below
+// DiskReclaimBytes AND no job is running.
+//
+// Split from PruneDiskArtifacts because it is the one maintenance step that is
+// NOT safe while the daemon is busy: pulling the build cache out from under a
+// live gate slows the run holding it and produces spurious "directory not
+// empty" errors. Worktrees and logs belong to finished jobs; the build cache is
+// shared with whatever is compiling right now.
+//
+// Skipping while busy is the right trade even though a busy day is exactly when
+// the disk fills. The hourly tick means any gap at all is enough, and the
+// enqueue thresholds remain as a backstop.
+func (e *Engine) ReclaimDiskIfIdle(ctx context.Context, probePath string) (before, after uint64, ran bool) {
+	if !e.idle() {
+		return 0, 0, false
+	}
+	return ReclaimBuildCache(ctx, probePath)
+}
+
 // Clean prunes finished jobs from memory, removes stale worktrees, deletes old logs, and forces GC.
 func (e *Engine) Clean() CleanReport {
 	// 1. Identify active jobs
