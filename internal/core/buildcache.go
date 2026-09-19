@@ -2,7 +2,9 @@ package core
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -19,10 +21,14 @@ import (
 // experience. Refusing to enqueue is the correct behaviour but it is not a
 // solution: it stops new work without freeing anything, so a full disk stays
 // full and every queued gate keeps failing.
-const DiskReclaimBytes = 20 << 30
+const (
+	DiskReclaimBytes       = 20 << 30
+	BuildCacheReclaimBytes = 20 << 30
+)
 
-// ReclaimBuildCache empties the Go build cache when free disk has fallen below
-// DiskReclaimBytes.
+// ReclaimBuildCache empties the Go build cache when either free disk has fallen
+// below DiskReclaimBytes or the cache itself has reached
+// BuildCacheReclaimBytes.
 //
 // This exists because the Go build cache has NO size limit, which is not
 // obvious from its documentation. Its only self-management is deleting entries
@@ -50,12 +56,12 @@ const DiskReclaimBytes = 20 << 30
 // the lock.
 func ReclaimBuildCache(ctx context.Context, probePath string) (before, after uint64, ran bool) {
 	before, ok := FreeDiskBytes(probePath)
-	if !ok || before >= DiskReclaimBytes {
+	if _, err := exec.LookPath("go"); err != nil {
+		// No toolchain on the daemon's PATH: nothing to inspect or reclaim.
 		return before, before, false
 	}
-	if _, err := exec.LookPath("go"); err != nil {
-		// No toolchain on the daemon's PATH: nothing to reclaim, and this is
-		// not an error worth surfacing on a machine that only runs shell gates.
+	cacheBytes, cacheOK := goBuildCacheBytes(ctx)
+	if !shouldReclaimBuildCache(before, ok, cacheBytes, cacheOK) {
 		return before, before, false
 	}
 
@@ -75,6 +81,41 @@ func ReclaimBuildCache(ctx context.Context, probePath string) (before, after uin
 		return before, before, true
 	}
 	return before, after, true
+}
+
+func shouldReclaimBuildCache(freeBytes uint64, freeOK bool, cacheBytes uint64, cacheOK bool) bool {
+	return (freeOK && freeBytes < DiskReclaimBytes) ||
+		(cacheOK && cacheBytes >= BuildCacheReclaimBytes)
+}
+
+// goBuildCacheBytes returns the logical size of the active Go build cache.
+// Go's cache has no configured size ceiling, so free-space checks alone allow
+// it to consume hundreds of gigabytes on a large disk before reclamation.
+func goBuildCacheBytes(ctx context.Context) (uint64, bool) {
+	cmd := exec.CommandContext(ctx, "go", "env", "GOCACHE")
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, false
+	}
+	cacheDir := strings.TrimSpace(string(out))
+	if cacheDir == "" || cacheDir == "off" {
+		return 0, false
+	}
+
+	var total uint64
+	err = filepath.Walk(cacheDir, func(_ string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.Mode().IsRegular() && info.Size() > 0 {
+			total += uint64(info.Size())
+		}
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return 0, true
+	}
+	return total, err == nil
 }
 
 func runGoCleanCache(ctx context.Context) error {

@@ -64,7 +64,9 @@ completed job is reported by `list --ref` rather than silently reused.
 The daemon auto-starts, defaults to one worker, and shuts down after 30 idle
 minutes. An exclusive ownership lock protects shared recovery and cleanup;
 startup also refuses a live legacy socket. Hourly cleanup prunes old disk
-artifacts even while the daemon stays busy. Active jobs are never evicted by
+artifacts even while the daemon stays busy. The shared Go build cache is
+reclaimed while idle if it reaches 20 GiB or free disk falls below 20 GiB; the
+same check runs before idle shutdown. Active jobs are never evicted by
 completed-history limits. Completed records and logs have 48-hour retention.
 
 Default locations:

@@ -665,6 +665,10 @@ func runDaemon(args []string) int {
 					continue
 				}
 				if engine.TryDrainIdle(idleShutdown) {
+					if before, after, ran := engine.ReclaimDiskIfIdle(context.Background(), worktreeBaseDir()); ran {
+						fmt.Printf("\n[pushguard] reclaimed the Go build cache before idle shutdown: %s free -> %s free\n",
+							core.HumanBytes(before), core.HumanBytes(after))
+					}
 					report := engine.Clean()
 					fmt.Printf("\n[pushguard] idle for %s with no jobs — cleaning up and shutting down "+
 						"(jobs flushed=%d, worktrees pruned=%d, logs pruned=%d)\n",
@@ -706,10 +710,10 @@ func runDaemon(args []string) int {
 						worktreesPruned, logsPruned, jobRecordsPruned)
 				}
 				// Worktrees and logs are usually not where the space went. The
-				// Go build cache has no size limit and grew to 171 GB on
+				// Go build cache has no native size limit and grew to 171 GB on
 				// 2026-09-09, filling a 926 GB volume and failing three gates
-				// with misattributed "[build failed]" errors. Reclaim it before
-				// the enqueue thresholds have to start refusing work.
+				// with misattributed "[build failed]" errors. Reclaim it at its
+				// own ceiling or before enqueue thresholds start refusing work.
 				if before, after, ran := engine.ReclaimDiskIfIdle(context.Background(), worktreeBaseDir()); ran {
 					fmt.Printf("[pushguard] reclaimed the Go build cache: %s free -> %s free\n",
 						core.HumanBytes(before), core.HumanBytes(after))

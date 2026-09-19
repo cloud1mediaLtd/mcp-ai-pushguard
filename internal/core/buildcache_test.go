@@ -24,6 +24,7 @@ func TestDiskThresholdLadder(t *testing.T) {
 // healthy disk. This is the guard that keeps an hourly tick from emptying the
 // build cache of a machine that has hundreds of gigabytes free.
 func TestReclaimBuildCacheSkipsWhenThereIsRoom(t *testing.T) {
+	t.Setenv("GOCACHE", t.TempDir())
 	// The test's own temp dir is on a filesystem with room; if it were not,
 	// the suite could not run at all.
 	before, after, ran := ReclaimBuildCache(context.Background(), t.TempDir())
@@ -38,9 +39,28 @@ func TestReclaimBuildCacheSkipsWhenThereIsRoom(t *testing.T) {
 // A path it cannot stat must be treated as "cannot tell", not as "no space".
 // Guessing "full" here would empty the build cache on every tick.
 func TestReclaimBuildCacheSkipsWhenItCannotStat(t *testing.T) {
+	t.Setenv("GOCACHE", t.TempDir())
 	_, _, ran := ReclaimBuildCache(context.Background(), "/definitely/not/a/real/path/pushguard-test")
 	if ran {
 		t.Fatal("reclaim ran against an unstattable path; a failed stat must not read as a full disk")
+	}
+}
+
+func TestShouldReclaimBuildCacheAtSizeCeiling(t *testing.T) {
+	if !shouldReclaimBuildCache(500<<30, true, BuildCacheReclaimBytes, true) {
+		t.Fatal("a cache at the size ceiling must be reclaimed even when the disk has room")
+	}
+}
+
+func TestShouldReclaimBuildCacheBelowSizeCeiling(t *testing.T) {
+	if shouldReclaimBuildCache(500<<30, true, BuildCacheReclaimBytes-1, true) {
+		t.Fatal("a cache below the size ceiling on a healthy disk must be retained")
+	}
+}
+
+func TestShouldReclaimBuildCacheWhenDiskIsLow(t *testing.T) {
+	if !shouldReclaimBuildCache(DiskReclaimBytes-1, true, 0, false) {
+		t.Fatal("low disk space must reclaim even when cache size cannot be measured")
 	}
 }
 
