@@ -16,25 +16,41 @@ import (
 // Ordered most specific first. The first pattern that matches anything wins,
 // so a run with a real assertion failure reports that rather than the generic
 // "make: *** [target] Error 2" it also emitted.
-var failureMarkers = []*regexp.Regexp{
+type failureMarker struct {
+	pattern *regexp.Regexp
+	// Every match must contain at least one of these literals. This skips
+	// regex work on ordinary passing output, both for whole logs and lines.
+	literals []string
+}
+
+func (m failureMarker) candidate(text string) bool {
+	for _, literal := range m.literals {
+		if strings.Contains(text, literal) {
+			return true
+		}
+	}
+	return false
+}
+
+var failureMarkers = []failureMarker{
 	// Go test: the failing test and its message.
-	regexp.MustCompile(`^\s*--- FAIL: `),
+	{regexp.MustCompile(`^\s*--- FAIL: `), []string{"--- FAIL: "}},
 	// Go build/vet/lint diagnostics: path:line:col: message.
-	regexp.MustCompile(`^[^\s:]+\.go:\d+:\d+: `),
+	{regexp.MustCompile(`^[^\s:]+\.go:\d+:\d+: `), []string{".go:"}},
 	// Node/vitest/jest.
-	regexp.MustCompile(`^\s*(?:✗|×|FAIL|●) `),
+	{regexp.MustCompile(`^\s*(?:✗|×|FAIL|●) `), []string{"✗ ", "× ", "FAIL ", "● "}},
 	// Package-level Go failures, after the specific ones above.
-	regexp.MustCompile(`^(?:FAIL|ok)?\s*FAIL\s`),
+	{regexp.MustCompile(`^(?:FAIL|ok)?\s*FAIL\s`), []string{"FAIL"}},
 	// Panics and fatals.
-	regexp.MustCompile(`^(?:panic:|fatal error:|fatal: )`),
+	{regexp.MustCompile(`^(?:panic:|fatal error:|fatal: )`), []string{"panic:", "fatal error:", "fatal: "}},
 	// A tool that failed for its own reasons rather than because the code is
 	// wrong -- "Error: parallel golangci-lint is running", a missing binary, a
 	// database that would not start. Ranked here because it is a real cause and
 	// make is not, but below the code-level markers: a run with BOTH a failing
 	// test and a noisy tool error is better summarised by the failing test.
-	regexp.MustCompile(`^(?:Error|ERROR|error): `),
+	{regexp.MustCompile(`^(?:Error|ERROR|error): `), []string{"Error: ", "ERROR: ", "error: "}},
 	// Make, last: it is the consequence of one of the above, not the cause.
-	regexp.MustCompile(`^make(?:\[\d+\])?: \*\*\* `),
+	{regexp.MustCompile(`^make(?:\[\d+\])?: \*\*\* `), []string{"make"}},
 }
 
 // FailureContext is how many lines after a matched marker are worth keeping.
@@ -52,53 +68,66 @@ func ExtractFailure(logs string, maxLines int) string {
 	if strings.TrimSpace(logs) == "" || maxLines <= 0 {
 		return ""
 	}
-	lines := strings.Split(logs, "\n")
-
 	for _, marker := range failureMarkers {
-		keep := map[int]bool{}
-		for i, line := range lines {
-			if !marker.MatchString(line) {
-				continue
-			}
-			for j := i; j < len(lines) && j <= i+FailureContext; j++ {
-				keep[j] = true
-			}
+		if !marker.candidate(logs) {
+			continue
 		}
-		if len(keep) == 0 {
+		type span struct{ start, end int }
+		var windows []span
+		// Only the ends of the current line and its three following context
+		// lines are needed. Avoid allocating an entry for every line in a log.
+		var recentEnds [FailureContext + 1]int
+		used, nextStart, nextRow := 0, len(logs)+1, -1
+		row := 0
+		for end := len(logs); end >= 0; row++ {
+			start := strings.LastIndexByte(logs[:end], '\n') + 1
+			recentEnds[row%len(recentEnds)] = end
+			if line := logs[start:end]; marker.candidate(line) && marker.pattern.MatchString(line) {
+				count := min(row+1, FailureContext+1)
+				windowEnd := recentEnds[(row-count+1)%len(recentEnds)]
+				if nextRow >= 0 && row-nextRow <= count {
+					count = row - nextRow
+					windowEnd = nextStart - 1
+				}
+				cost := count
+				if len(windows) == 0 && count > maxLines {
+					cost = maxLines
+					windowEnd = recentEnds[(row-cost+1)%len(recentEnds)]
+				} else if len(windows) > 0 && windowEnd+1 < nextStart {
+					cost++ // Omission separators count toward the line budget.
+				}
+				if cost > maxLines-used {
+					break
+				}
+				windows = append(windows, span{start, windowEnd})
+				used += cost
+				nextStart, nextRow = start, row
+				if used == maxLines {
+					break
+				}
+			}
+			end = start - 1
+		}
+		if len(windows) == 0 {
 			continue
 		}
 
-		indexes := make([]int, 0, len(keep))
-		for i := range keep {
-			indexes = append(indexes, i)
-		}
-		// keep is a set, so sort before slicing -- and drop from the FRONT so
-		// the last failure survives.
-		sortInts(indexes)
-		if len(indexes) > maxLines {
-			indexes = indexes[len(indexes)-maxLines:]
-		}
-
-		out := make([]string, 0, len(indexes))
-		previous := -2
-		for _, i := range indexes {
-			if previous >= 0 && i > previous+1 {
-				out = append(out, "  …")
+		var out strings.Builder
+		previousEnd := -1
+		for i := len(windows) - 1; i >= 0; i-- {
+			window := windows[i]
+			if previousEnd >= 0 {
+				out.WriteByte('\n')
+				if window.start > previousEnd+1 {
+					out.WriteString("  …\n")
+				}
 			}
-			out = append(out, lines[i])
-			previous = i
+			out.WriteString(logs[window.start:window.end])
+			previousEnd = window.end
 		}
-		return strings.Join(out, "\n")
+		return out.String()
 	}
 	return ""
-}
-
-func sortInts(values []int) {
-	for i := 1; i < len(values); i++ {
-		for j := i; j > 0 && values[j] < values[j-1]; j-- {
-			values[j], values[j-1] = values[j-1], values[j]
-		}
-	}
 }
 
 // namedFailure matches the header line of one Go test failure.

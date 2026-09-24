@@ -64,8 +64,12 @@ func TestSortForQueueViewIsStableAndNilSafe(t *testing.T) {
 		return []*Job{b, a, nil}
 	}
 	first, second := build(), build()
+	second[0], second[1] = second[1], second[0]
 	SortForQueueView(first)
 	SortForQueueView(second)
+	if first[0].ID != "pg_aaa" {
+		t.Fatalf("equal timestamps must break ties by ID, got %s first", first[0].ID)
+	}
 	for i := range first {
 		if (first[i] == nil) != (second[i] == nil) {
 			t.Fatalf("ordering is not stable at %d", i)

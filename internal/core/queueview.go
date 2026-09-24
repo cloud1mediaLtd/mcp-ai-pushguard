@@ -36,11 +36,11 @@ func SortForQueueView(jobs []*Job) {
 		}
 		// Queued jobs run oldest-first, so that is their real order. Finished
 		// jobs are history, so the newest is the interesting one.
-		if ra == 1 {
-			return jobs[a].CreatedAt.Before(jobs[b].CreatedAt)
-		}
 		if jobs[a].CreatedAt.Equal(jobs[b].CreatedAt) {
 			return jobs[a].ID < jobs[b].ID
+		}
+		if ra == 1 {
+			return jobs[a].CreatedAt.Before(jobs[b].CreatedAt)
 		}
 		return jobs[a].CreatedAt.After(jobs[b].CreatedAt)
 	})

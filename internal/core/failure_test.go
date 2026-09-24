@@ -91,6 +91,34 @@ func TestExtractFailureKeepsTheLastFailuresWhenTruncating(t *testing.T) {
 	}
 }
 
+func TestExtractFailureLineBudget(t *testing.T) {
+	t.Parallel()
+	const last = "--- FAIL: TestLast\n    last_test.go:9: wanted X\ncontext two\ncontext three"
+	const sparse = "--- FAIL: TestFirst\nfirst context\ncontext two\ncontext three\nnoise\n" + last
+	tests := []struct {
+		name     string
+		logs     string
+		maxLines int
+		want     string
+	}{
+		{name: "one line retains header", logs: last, maxLines: 1, want: "--- FAIL: TestLast"},
+		{name: "two lines retain cause", logs: last, maxLines: 2, want: "--- FAIL: TestLast\n    last_test.go:9: wanted X"},
+		{name: "separator counts toward budget", logs: sparse, maxLines: 8, want: last},
+		{name: "both windows fit", logs: sparse, maxLines: 9, want: "--- FAIL: TestFirst\nfirst context\ncontext two\ncontext three\n  …\n" + last},
+		{name: "overlapping context appears once", logs: "--- FAIL: TestFirst\n" + last, maxLines: 5, want: "--- FAIL: TestFirst\n" + last},
+		{name: "zero budget", logs: last, maxLines: 0, want: ""},
+		{name: "negative budget", logs: last, maxLines: -1, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := ExtractFailure(tt.logs, tt.maxLines); got != tt.want {
+				t.Errorf("ExtractFailure() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestExtractFailureReturnsNothingForAPassingRun(t *testing.T) {
 	logs := "ok  \tpkg/a\t1.0s\nok  \tpkg/b\t2.0s\npre-push: PASS"
 	if got := ExtractFailure(logs, 20); got != "" {
@@ -190,5 +218,63 @@ func TestFailureNamesCollapsesSubtests(t *testing.T) {
 	logs := "--- FAIL: TestParent (0.00s)\n    --- FAIL: TestParent/case_one (0.00s)\n    --- FAIL: TestParent/case_two (0.00s)\n"
 	if got := FailureNames(logs); len(got) != 1 || got[0] != "TestParent" {
 		t.Fatalf("expected one parent failure, got %v", got)
+	}
+}
+
+func BenchmarkExtractFailure(b *testing.B) {
+	passing := strings.Repeat("ok  \tgithub.com/example/backend/internal/workers\t1.4s\n", 100000)
+	failure := "--- FAIL: TestExample\n    example_test.go:9: wanted X\nFAIL\n"
+	for _, tc := range []struct {
+		name string
+		logs string
+	}{
+		{name: "late_failure", logs: passing + failure},
+		{name: "early_failure", logs: failure + passing},
+		{name: "many_failures", logs: strings.Repeat(failure, 100000)},
+		{name: "passing", logs: passing},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				ExtractFailure(tc.logs, 30)
+			}
+		})
+	}
+}
+
+func TestExtractFailureMarkerPrefilters(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		line string
+	}{
+		{name: "indented test", line: "\t--- FAIL: TestExample"},
+		{name: "compiler", line: "pkg/example.go:12:3: undefined name"},
+		{name: "vitest", line: "  × example"},
+		{name: "checkmark", line: "  ✗ example"},
+		{name: "jest", line: "  ● example"},
+		{name: "node fail", line: " FAIL example"},
+		{name: "package tab", line: "FAIL\tpkg/example"},
+		{name: "package prefixed", line: "ok\tFAIL\tpkg/example"},
+		{name: "panic", line: "panic: example"},
+		{name: "runtime fatal", line: "fatal error: example"},
+		{name: "fatal", line: "fatal: example"},
+		{name: "tool", line: "Error: example"},
+		{name: "uppercase tool", line: "ERROR: example"},
+		{name: "lowercase tool", line: "error: example"},
+		{name: "make", line: "make: *** [test] Error 1"},
+		{name: "nested make", line: "make[2]: *** [test] Error 1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			logs := "ordinary output\n" + tc.line + "\nmore output\n"
+			if got := ExtractFailure(logs, 1); got != tc.line {
+				t.Errorf("ExtractFailure() = %q, want %q", got, tc.line)
+			}
+			// A substring elsewhere in a line must not become a failure.
+			if got := ExtractFailure("ordinary output mentions "+tc.line, 1); got != "" {
+				t.Errorf("unanchored marker matched: %q", got)
+			}
+		})
 	}
 }
