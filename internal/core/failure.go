@@ -65,6 +65,7 @@ const FailureContext = 3
 // a run that fails many packages is best summarised by where it gave up, and
 // truncating from the front would bury that behind the earliest failure.
 func ExtractFailure(logs string, maxLines int) string {
+	logs = FailedScope(logs)
 	if strings.TrimSpace(logs) == "" || maxLines <= 0 {
 		return ""
 	}
@@ -130,6 +131,97 @@ func ExtractFailure(logs string, maxLines int) string {
 	return ""
 }
 
+const stageMarker = "pre-push: stage="
+
+// stageLine parses a gate-stage.sh line: "pre-push: stage=<label> started" or
+// "pre-push: stage=<label> status=<passed|failed> ...".
+func stageLine(line string) (label, state string, ok bool) {
+	rest, found := strings.CutPrefix(line, stageMarker)
+	if !found {
+		return "", "", false
+	}
+	label, rest, _ = strings.Cut(rest, " ")
+	switch {
+	case rest == "started":
+		return label, "started", true
+	case strings.HasPrefix(rest, "status=failed"):
+		return label, "failed", true
+	case strings.HasPrefix(rest, "status=passed"):
+		return label, "passed", true
+	}
+	return "", "", false
+}
+
+// FailedScope narrows a gate log to the output of the stage(s) that failed.
+//
+// A passing stage can print ERROR lines on purpose: a unit test that feeds the
+// migration guard a DROP TABLE prints the guard's complaint and passes. Those
+// lines looked like the cause of a later, unrelated failure, and the same
+// excerpt was printed for a job that exited 0.
+//
+// The gate wraps each stage in gate-stage.sh, which brackets its output with
+// "stage=X started" and "stage=X status=failed|passed". The outer "total" stage
+// wraps everything, so it only counts when no inner stage failed.
+//
+//   - no stage markers: not a gate log, returned unchanged;
+//   - markers but nothing failed: "" (a passing job has no failure to explain);
+//   - an inner stage failed: only the span of each failed stage;
+//   - only "total" failed: the whole log, since the failure sits outside any
+//     inner stage.
+//
+// A log tail whose "started" line was cut off keeps the span from the start of
+// the log.
+func FailedScope(logs string) string {
+	if !strings.Contains(logs, stageMarker) {
+		return logs
+	}
+	var out strings.Builder
+	totalFailed := false
+	spanStart := 0 // byte offset where the current candidate span begins
+	started := map[string]int{}
+	for pos := 0; pos < len(logs); {
+		end := strings.IndexByte(logs[pos:], '\n')
+		next := len(logs)
+		if end >= 0 {
+			end += pos
+			next = end + 1
+		} else {
+			end = len(logs)
+		}
+		label, state, ok := stageLine(logs[pos:end])
+		if ok {
+			switch state {
+			case "started":
+				started[label] = pos
+			case "failed":
+				if label == "total" {
+					totalFailed = true
+					break
+				}
+				from, seen := started[label]
+				if !seen {
+					from = spanStart
+				}
+				out.WriteString(logs[from:next])
+				if next > 0 && logs[next-1] != '\n' {
+					out.WriteByte('\n')
+				}
+			}
+			if state != "started" && label != "total" {
+				spanStart = next
+			}
+		}
+		pos = next
+	}
+	if out.Len() > 0 {
+		return out.String()
+	}
+	if totalFailed {
+		return logs
+	}
+	return ""
+}
+
 // namedFailure matches the header line of one Go test failure.
 var namedFailure = regexp.MustCompile(`(?m)^\s*--- FAIL: (\S+)`)
 
@@ -145,6 +237,7 @@ var namedFailure = regexp.MustCompile(`(?m)^\s*--- FAIL: (\S+)`)
 // log actually held five. Each had a different subset and each believed it was
 // the whole. A summary that can omit items must say that it did.
 func FailureNames(logs string) []string {
+	logs = FailedScope(logs)
 	seen := map[string]bool{}
 	names := make([]string, 0, 4)
 	for _, m := range namedFailure.FindAllStringSubmatch(logs, -1) {

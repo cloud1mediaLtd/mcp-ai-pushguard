@@ -488,7 +488,7 @@ func (s *Server) toolStatus(out io.Writer, id any, args map[string]any) {
 	if logs != "" {
 		// Answer "why did it fail" before "what did it print". Everything
 		// below this line is context; this line is the result.
-		if failure := core.ExtractFailure(logs, 30); failure != "" {
+		if failure := core.ExtractFailure(logs, 30); failure != "" && job.Status != api.StatusPassed {
 			// Name every failing test first: the excerpt below is a bounded
 			// window that drops from the front, so on a multi-failure run it
 			// shows the last of them and says nothing about the rest.

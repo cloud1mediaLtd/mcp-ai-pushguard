@@ -272,7 +272,7 @@ func handleStatus(args []string) {
 	// Lead with why it failed. A failed pre-push run is several hundred lines
 	// of "ok" and a handful that matter, and the tail is whatever finished
 	// last -- which is rarely the thing that broke.
-	if failure := core.ExtractFailure(logs, 30); failure != "" {
+	if failure := core.ExtractFailure(logs, 30); failure != "" && job.Status != api.StatusPassed {
 		if names := core.FailureNames(logs); len(names) > 0 {
 			fmt.Printf("\n--- %d failing test(s): %s\n", len(names), strings.Join(names, ", "))
 		}
@@ -835,7 +835,7 @@ func statusFromDisk(jobID string) {
 	if logs == "" {
 		return
 	}
-	if failure := core.ExtractFailure(logs, 30); failure != "" {
+	if failure := core.ExtractFailure(logs, 30); failure != "" && job.Status != core.StatusPassed {
 		if names := core.FailureNames(logs); len(names) > 0 {
 			fmt.Printf("\n--- %d failing test(s): %s\n", len(names), strings.Join(names, ", "))
 		}
@@ -954,7 +954,8 @@ func exitCodeFor(job api.Job) int {
 func reportFinishedJob(job api.Job, logs string) {
 	printProvenance(job)
 	fmt.Printf("%s (exit %d) in %s\n", strings.ToUpper(string(job.Status)), job.ExitCode, job.DurationString())
-	if logs != "" {
+	// A passed job has nothing to explain, even if its logs print errors.
+	if logs != "" && job.Status != api.StatusPassed {
 		// Name every failing test before showing the excerpt. ExtractFailure is
 		// a bounded window that drops from the front, so on a run with several
 		// failures it shows the last of them and says nothing about the rest —

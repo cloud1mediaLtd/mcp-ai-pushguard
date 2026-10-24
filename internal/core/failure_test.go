@@ -278,3 +278,78 @@ func TestExtractFailureMarkerPrefilters(t *testing.T) {
 		})
 	}
 }
+
+// A passing stage prints ERROR on purpose (a unit test feeding the migration
+// guard a DROP TABLE); a later stage fails for an unrelated reason.
+const gateLogExpectedErrorThenFailure = `pre-push: stage=total started
+pre-push: stage=test started
+ERROR: production-risk migration operation(s) detected:
+  - migrations/platform/000001_x.up.sql:2  DROP_TABLE  drops a table
+Use an expand/contract migration, or — if the operation is genuinely safe —
+ok  	github.com/example/backend/internal/migrations	0.4s
+pre-push: stage=test status=passed elapsed=90s exit=0
+pre-push: stage=consumers-check started
+ERROR: stale generated copy: saas/api-types.ts
+pre-push: stage=consumers-check status=failed elapsed=3s exit=1
+pre-push: stage=total status=failed elapsed=95s exit=1
+`
+
+func TestExtractFailureIgnoresErrorsFromPassingStages(t *testing.T) {
+	got := ExtractFailure(gateLogExpectedErrorThenFailure, 30)
+	if strings.Contains(got, "production-risk migration") {
+		t.Errorf("excerpt came from a passing stage:\n%s", got)
+	}
+	if !strings.Contains(got, "stale generated copy") {
+		t.Errorf("excerpt missed the failed stage's output:\n%s", got)
+	}
+}
+
+func TestExtractFailureEmptyForPassingGateLog(t *testing.T) {
+	log := `pre-push: stage=total started
+pre-push: stage=test started
+ERROR: production-risk migration operation(s) detected:
+--- FAIL: TestExpectedInsideFixture (0.00s)
+pre-push: stage=test status=passed elapsed=90s exit=0
+pre-push: stage=total status=passed elapsed=91s exit=0
+`
+	if got := ExtractFailure(log, 30); got != "" {
+		t.Errorf("passing job produced an excerpt:\n%s", got)
+	}
+	if got := FailureNames(log); len(got) != 0 {
+		t.Errorf("passing job named failures: %v", got)
+	}
+}
+
+func TestExtractFailureTotalOnlyFailureKeepsWholeLog(t *testing.T) {
+	log := `pre-push: stage=total started
+make: *** [pre-push] Error 2
+pre-push: stage=total status=failed elapsed=1s exit=2
+`
+	if got := ExtractFailure(log, 30); !strings.Contains(got, "make: ***") {
+		t.Errorf("failure outside any inner stage was dropped:\n%s", got)
+	}
+}
+
+func TestFailedScopeTruncatedTailWithoutStartLine(t *testing.T) {
+	log := `ERROR: from the cut-off tail of a passing stage
+pre-push: stage=test status=passed elapsed=9s exit=0
+pre-push: stage=lint started
+main.go:3:4: undefined: x
+pre-push: stage=lint status=failed elapsed=2s exit=1
+`
+	got := FailedScope(log)
+	if strings.Contains(got, "cut-off tail") || !strings.Contains(got, "undefined: x") {
+		t.Errorf("unexpected scope:\n%s", got)
+	}
+	// Failed stage whose start line was truncated: span begins at log start.
+	got = FailedScope("--- FAIL: TestA (0s)\npre-push: stage=test status=failed elapsed=1s exit=1\n")
+	if !strings.Contains(got, "TestA") {
+		t.Errorf("lost the output of a stage whose start was cut off:\n%s", got)
+	}
+}
+
+func TestFailedScopeLeavesNonGateLogsAlone(t *testing.T) {
+	if got := FailedScope("FAIL\tpkg\t1s\n"); got != "FAIL\tpkg\t1s\n" {
+		t.Errorf("non-gate log changed: %q", got)
+	}
+}
